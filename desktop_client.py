@@ -5,11 +5,25 @@ import os
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, scrolledtext
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-API_URL = os.getenv("ASSISTANT_API_URL", "http://127.0.0.1:8000/v1/chat/simple")
+def load_local_env() -> None:
+    env_path = Path(__file__).resolve().with_name(".env")
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_local_env()
+API_URL = os.getenv("ASSISTANT_API_URL", "https://ai-assistant-4yn0.onrender.com/v1/chat/simple")
 API_TOKEN = os.getenv("APP_API_TOKEN", "dev-token")
 
 
@@ -36,13 +50,21 @@ class ChatApp(tk.Tk):
 
         self.input = tk.Text(bottom, height=4, wrap=tk.WORD)
         self.input.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.input.bind("<Control-Return>", self.send_message)
+        self.input.bind("<Return>", self._handle_enter)
+        self.input.bind("<Shift-Return>", self._handle_shift_enter)
 
         self.send_button = tk.Button(bottom, text="Отправить", command=self.send_message)
         self.send_button.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.Y)
 
-        self._append("Система", "Готово. Напишите сообщение и нажмите Ctrl+Enter или кнопку отправки.")
+        self._append("Система", "Готово. Enter отправляет сообщение, Shift+Enter переносит строку.")
         self.after(100, self._poll_results)
+
+    def _handle_enter(self, event: object | None = None) -> str:
+        return self.send_message(event)
+
+    def _handle_shift_enter(self, event: object | None = None) -> str:
+        self.input.insert(tk.INSERT, "\n")
+        return "break"
 
     def send_message(self, event: object | None = None) -> str:
         text = self.input.get("1.0", tk.END).strip()
