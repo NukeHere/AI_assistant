@@ -61,3 +61,5 @@ $env:MODEL_NAME="gpt-oss:120b"
 $env:APP_API_TOKEN="long-random-client-token"
 python simple_server.py
 ```
+
+Note: requirements.txt intentionally does not install packages for the first MVP. The deployed simple_server.py uses only Python standard library modules.

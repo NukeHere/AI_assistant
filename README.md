@@ -38,7 +38,7 @@ C:\Ich\projects\AI_assistant\.venv\Scripts\python.exe desktop_client.py
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements-fastapi.txt
 $env:APP_API_TOKEN="dev-token"
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -115,3 +115,4 @@ $env:MODEL_NAME="your-model"
 Важно: бесплатный хостинг не сможет обращаться к локальному Ollama на твоём ПК.
 Для облака нужен Ollama API token, внешний OpenAI-compatible API или отдельный
 VPS, где модель доступна самому серверу.
+
