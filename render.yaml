@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ai-assistant-core
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python simple_server.py
+    envVars:
+      - key: ASSISTANT_HOST
+        value: 0.0.0.0
+      - key: MODEL_PROVIDER
+        value: ollama
+      - key: OLLAMA_API_BASE_URL
+        value: https://ollama.com
+      - key: OLLAMA_API_KEY
+        sync: false
+      - key: MODEL_NAME
+        sync: false
+      - key: APP_API_TOKEN
+        generateValue: true
