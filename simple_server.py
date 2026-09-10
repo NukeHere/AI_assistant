@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-HOST = os.getenv("ASSISTANT_HOST", "127.0.0.1")
+HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("ASSISTANT_PORT") or os.getenv("PORT") or "8000")
 API_TOKEN = os.getenv("APP_API_TOKEN", "dev-token")
 MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "mock").lower()
@@ -175,11 +175,12 @@ class AssistantHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
-    print(f"AI Assistant simple server: http://{HOST}:{PORT}")
-    print("Endpoint: POST /v1/chat/simple")
-    print("Model mode:", provider_mode())
+    print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
+    print("Endpoint: POST /v1/chat/simple", flush=True)
+    print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 
 
 if __name__ == "__main__":
     main()
+
