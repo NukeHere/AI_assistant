@@ -41,6 +41,9 @@ class ChatApp(tk.Tk):
         self.persona = "ANA"
 
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
+        self.history.bind("<Button-1>", self._focus_history)
+        self.history.bind("<Control-c>", self._copy_history_selection)
+        self.history.bind("<Control-C>", self._copy_history_selection)
         self.history.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
 
         bottom = tk.Frame(self)
@@ -62,6 +65,19 @@ class ChatApp(tk.Tk):
 
     def _handle_shift_enter(self, event: object | None = None) -> str:
         self.input.insert(tk.INSERT, "\n")
+        return "break"
+
+    def _focus_history(self, event: object | None = None) -> None:
+        self.history.focus_set()
+
+    def _copy_history_selection(self, event: object | None = None) -> str:
+        try:
+            selected_text = self.history.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return "break"
+
+        self.clipboard_clear()
+        self.clipboard_append(selected_text)
         return "break"
 
     def send_message(self, event: object | None = None) -> str:

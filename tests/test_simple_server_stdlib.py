@@ -79,6 +79,10 @@ class SimpleServerTests(unittest.TestCase):
         self.assertIn("does not use ALIEN metaphors", ana)
         self.assertIn("window", alien)
         self.assertIn("Priority order", alien)
+        self.assertIn("Do not print internal labels", ana)
+        self.assertNotIn("Default answer shape", ana)
+        self.assertNotIn("Default answer shape", alien)
+        self.assertIn("template headings", alien)
 
     def test_dialogue_quality_cases_are_represented(self) -> None:
         sample_cases = [
