@@ -11,6 +11,13 @@ from app.personas import Persona
 from app.smart_memory import score_text
 
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        result = super().__exit__(exc_type, exc_value, traceback)
+        self.close()
+        return bool(result)
+
+
 class Storage:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -74,7 +81,7 @@ class Storage:
             conn.execute(f"alter table {table} add column {column} {definition}")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -278,6 +285,227 @@ class Storage:
             ).fetchall()
         return [f"{row['kind']}: {row['content']}" for row in old_rows]
 
+    def export_client_snapshot(self, client_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            conversations = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select id, client_id, persona, alien_glossary_json, created_at, updated_at
+                      from conversations
+                     where client_id = ?
+                     order by updated_at, id
+                    """,
+                    (client_id,),
+                ).fetchall()
+            ]
+            conversation_ids = [row["id"] for row in conversations]
+            messages: list[dict[str, Any]] = []
+            if conversation_ids:
+                placeholders = ",".join("?" for _ in conversation_ids)
+                messages = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"""
+                        select conversation_id, role, content, created_at
+                          from messages
+                         where conversation_id in ({placeholders})
+                         order by id
+                        """,
+                        conversation_ids,
+                    ).fetchall()
+                ]
+            memories = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select client_id, kind, content, importance, created_at
+                      from memories
+                     where client_id = ?
+                     order by id
+                    """,
+                    (client_id,),
+                ).fetchall()
+            ]
+            memory_cells = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select client_id, kind, summary, full_content, topics_json, embedding_json,
+                           importance, created_at, updated_at, last_used_at
+                      from memory_cells
+                     where client_id = ?
+                     order by id
+                    """,
+                    (client_id,),
+                ).fetchall()
+            ]
+        return {
+            "format": "ai-assistant-snapshot-v1",
+            "client_id": client_id,
+            "conversations": conversations,
+            "messages": messages,
+            "memories": memories,
+            "memory_cells": memory_cells,
+        }
+
+    def import_client_snapshot(self, client_id: str, snapshot: dict[str, Any]) -> dict[str, int]:
+        if snapshot.get("format") != "ai-assistant-snapshot-v1":
+            raise ValueError("Unsupported snapshot format")
+        if snapshot.get("client_id") not in {None, "", client_id}:
+            raise ValueError("Snapshot client_id does not match request client_id")
+
+        conversations = snapshot.get("conversations") or []
+        messages = snapshot.get("messages") or []
+        memories = snapshot.get("memories") or []
+        memory_cells = snapshot.get("memory_cells") or []
+        if not all(isinstance(items, list) for items in [conversations, messages, memories, memory_cells]):
+            raise ValueError("Snapshot sections must be arrays")
+
+        counts = {"conversations": 0, "messages": 0, "memories": 0, "memory_cells": 0}
+        with self._lock, self._connect() as conn:
+            for item in conversations:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                conversation_id = str(item["id"])
+                persona = str(item.get("persona") or Persona.ANA.value)
+                if persona not in {Persona.ANA.value, Persona.ALIEN.value}:
+                    persona = Persona.ANA.value
+                glossary = str(item.get("alien_glossary_json") or "{}")
+                conn.execute(
+                    """
+                    insert into conversations (id, client_id, persona, alien_glossary_json, created_at, updated_at)
+                    values (?, ?, ?, ?, coalesce(?, current_timestamp), coalesce(?, current_timestamp))
+                    on conflict(id) do update set
+                        client_id = excluded.client_id,
+                        persona = excluded.persona,
+                        alien_glossary_json = excluded.alien_glossary_json,
+                        updated_at = max(conversations.updated_at, excluded.updated_at)
+                    """,
+                    (
+                        conversation_id,
+                        client_id,
+                        persona,
+                        glossary,
+                        item.get("created_at"),
+                        item.get("updated_at"),
+                    ),
+                )
+                counts["conversations"] += 1
+
+            for item in messages:
+                if not isinstance(item, dict):
+                    continue
+                conversation_id = str(item.get("conversation_id") or "").strip()
+                role = str(item.get("role") or "").strip()
+                content = str(item.get("content") or "")
+                created_at = str(item.get("created_at") or "")
+                if not conversation_id or role not in {"user", "assistant", "system"} or not content:
+                    continue
+                conn.execute(
+                    """
+                    insert into conversations (id, client_id, persona)
+                    values (?, ?, ?)
+                    on conflict(id) do nothing
+                    """,
+                    (conversation_id, client_id, Persona.ANA.value),
+                )
+                exists = conn.execute(
+                    """
+                    select 1 from messages
+                     where conversation_id = ? and role = ? and content = ? and created_at = ?
+                     limit 1
+                    """,
+                    (conversation_id, role, content, created_at),
+                ).fetchone()
+                if exists is None:
+                    conn.execute(
+                        """
+                        insert into messages (conversation_id, role, content, created_at)
+                        values (?, ?, ?, coalesce(?, current_timestamp))
+                        """,
+                        (conversation_id, role, content, created_at or None),
+                    )
+                    counts["messages"] += 1
+
+            for item in memories:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "manual")
+                content = str(item.get("content") or "")
+                if not content:
+                    continue
+                importance = int(item.get("importance") or 1)
+                exists = conn.execute(
+                    """
+                    select 1 from memories
+                     where client_id = ? and kind = ? and content = ?
+                     limit 1
+                    """,
+                    (client_id, kind, content),
+                ).fetchone()
+                if exists is None:
+                    conn.execute(
+                        """
+                        insert into memories (client_id, kind, content, importance, created_at)
+                        values (?, ?, ?, ?, coalesce(?, current_timestamp))
+                        """,
+                        (client_id, kind, content, importance, item.get("created_at")),
+                    )
+                    counts["memories"] += 1
+
+            for item in memory_cells:
+                if not isinstance(item, dict):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                full_content = str(item.get("full_content") or "").strip()
+                if not summary or not full_content:
+                    continue
+                kind = str(item.get("kind") or "thematic")
+                topics_json = str(item.get("topics_json") or "[]")
+                embedding_json = str(item.get("embedding_json") or "[]")
+                importance = int(item.get("importance") or 1)
+                existing = conn.execute(
+                    """
+                    select id from memory_cells
+                     where client_id = ? and lower(summary) = lower(?)
+                     limit 1
+                    """,
+                    (client_id, summary),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """
+                        insert into memory_cells
+                            (client_id, kind, summary, full_content, topics_json, embedding_json,
+                             importance, created_at, updated_at, last_used_at)
+                        values (?, ?, ?, ?, ?, ?, ?, coalesce(?, current_timestamp), coalesce(?, current_timestamp), ?)
+                        """,
+                        (
+                            client_id,
+                            kind,
+                            summary,
+                            full_content,
+                            topics_json,
+                            embedding_json,
+                            importance,
+                            item.get("created_at"),
+                            item.get("updated_at"),
+                            item.get("last_used_at"),
+                        ),
+                    )
+                    counts["memory_cells"] += 1
+                else:
+                    conn.execute(
+                        """
+                        update memory_cells
+                           set kind = ?, full_content = ?, topics_json = ?, embedding_json = ?,
+                               importance = max(importance, ?), updated_at = current_timestamp
+                         where id = ?
+                        """,
+                        (kind, full_content, topics_json, embedding_json, importance, existing["id"]),
+                    )
+        return counts
     def _memory_rows(self, client_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             return [

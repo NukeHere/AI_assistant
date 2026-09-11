@@ -26,6 +26,7 @@
 - Устойчивый словарь метафор ALIEN внутри разговора.
 - UI-оформление structured-блоков `Observation`, `Diagnosis`, `Action`, `Explanation`, `Conclusion`.
 - Команда `/functions` и системный список возможностей, чтобы модель знала свои доступные функции и ограничения.
+- Snapshot памяти/истории через `/v1/snapshot`: desktop-клиент хранит локальную копию и восстанавливает Render после redeploy/restart.
 - Заготовки под backup и следующий голосовой слой.
 - Подготовка к деплою: `Dockerfile`, `render.yaml`, стандартный `PORT`.
 
@@ -157,3 +158,28 @@ $env:MODEL_NAME="your-model"
 Важно: бесплатный Render без persistent disk не является надёжным долговременным
 хранилищем. Для настоящей памяти между redeploy/restart позже нужен внешний
 storage: PostgreSQL, S3/Yandex Disk backup-слой или отдельный VPS с диском.
+
+
+## Резервные копии памяти Render на ПК
+
+На бесплатном Render файловая система не постоянная: после redeploy/restart SQLite-память может очиститься. Для MVP добавлен локальный backup-agent, который запускается на твоём ПК и забирает snapshot памяти с Render.
+
+Один backup вручную:
+
+```powershell
+.\.venv\Scripts\python.exe backup_agent.py once
+```
+
+Постоянный режим: backup каждые 12 часов, хранить последние 10 копий:
+
+```powershell
+.\.venv\Scripts\python.exe backup_agent.py loop --interval 43200
+```
+
+Восстановить Render из последней локальной копии:
+
+```powershell
+.\.venv\Scripts\python.exe backup_agent.py restore latest
+```
+
+Копии лежат по умолчанию в `%USERPROFILE%\.ai_assistant\backups`. Если хочешь хранить их в Яндекс.Диске, добавь в локальный `.env` переменную `ASSISTANT_BACKUP_DIR` с путём к синхронизируемой папке.

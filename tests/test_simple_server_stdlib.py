@@ -10,6 +10,7 @@ from app.storage import Storage
 from simple_server import (
     handle_history_request,
     handle_message_request,
+    handle_snapshot_request,
     mock_response,
     provider_mode,
     valid_messages,
@@ -210,6 +211,47 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(history["persona"], "ANA")
         self.assertGreaterEqual(len(history["messages"]), 2)
         self.assertEqual(history["messages"][0]["role"], "user")
+
+    def test_snapshot_export_import_restores_memory_after_empty_storage(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            first = Storage(Path(temp_dir) / "first.sqlite3")
+            first.init()
+            first.remember("primary-user", "manual", "любимый цвет пользователя — синий", importance=4)
+            first.ensure_conversation("primary-user", "default")
+            first.add_message("default", "user", "Привет")
+            snapshot = first.export_client_snapshot("primary-user")
+
+            second = Storage(Path(temp_dir) / "second.sqlite3")
+            second.init()
+            imported = second.import_client_snapshot("primary-user", snapshot)
+            memories = second.list_memories("primary-user")
+            history = second.recent_messages("default", 10)
+
+        self.assertGreaterEqual(imported["memory_cells"], 1)
+        self.assertIn("синий", memories[0]["summary"])
+        self.assertEqual(history[0]["content"], "Привет")
+
+    def test_snapshot_endpoint_exports_and_imports_client_state(self) -> None:
+        with isolated_storage():
+            handle_message_request(
+                {
+                    "client_id": "primary-user",
+                    "conversation_id": "snapshot-test",
+                    "text": "запомни: Render без диска теряет sqlite память",
+                }
+            )
+            exported = handle_snapshot_request({"client_id": "primary-user", "action": "export"})
+            simple_server.storage = Storage(Path(simple_server.storage.db_path).with_name("empty.sqlite3"))
+            simple_server.storage.init()
+            imported = handle_snapshot_request(
+                {"client_id": "primary-user", "action": "import", "snapshot": exported["snapshot"]}
+            )
+            listed = handle_message_request(
+                {"client_id": "primary-user", "conversation_id": "snapshot-test", "text": "/memory"}
+            )
+
+        self.assertTrue(imported["ok"])
+        self.assertIn("Render", listed["text"])
 
     def test_alien_glossary_extracts_stable_terms(self) -> None:
         terms = extract_alien_glossary_terms("API сервера отдаёт ошибку")

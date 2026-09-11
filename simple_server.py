@@ -62,6 +62,23 @@ def handle_history_request(body: dict[str, object]) -> dict[str, object]:
     }
 
 
+def handle_snapshot_request(body: dict[str, object]) -> dict[str, object]:
+    client_id = str(body.get("client_id") or DEFAULT_CLIENT_ID).strip()
+    action = str(body.get("action") or "export").strip().lower()
+    if not client_id:
+        raise ValueError("client_id is required")
+    if action == "export":
+        snapshot = storage.export_client_snapshot(client_id)
+        return {"ok": True, "action": "export", "snapshot": snapshot}
+    if action == "import":
+        snapshot = body.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValueError("snapshot object is required")
+        counts = storage.import_client_snapshot(client_id, snapshot)
+        return {"ok": True, "action": "import", "imported": counts}
+    raise ValueError("action must be export or import")
+
+
 def handle_memory_command(client_id: str, conversation_id: str, text: str, persona: Persona) -> dict[str, object] | None:
     stripped = text.strip()
     lower = stripped.lower()
@@ -337,7 +354,7 @@ def valid_messages(value: object) -> bool:
 
 
 class AssistantHandler(BaseHTTPRequestHandler):
-    server_version = "AIAssistantSimple/0.5"
+    server_version = "AIAssistantSimple/0.6"
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -350,12 +367,13 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "model_mode": provider_mode(),
                 "message_endpoint": "/v1/message",
                 "history_endpoint": "/v1/history",
+                "snapshot_endpoint": "/v1/snapshot",
                 "smart_memory": True,
             }
         )
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history"}:
+        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot"}:
             self.send_json({"error": "Not found"}, status=404)
             return
         if not self.authorized():
@@ -371,6 +389,9 @@ class AssistantHandler(BaseHTTPRequestHandler):
         try:
             if self.path == "/v1/history":
                 self.send_json(handle_history_request(body))
+                return
+            if self.path == "/v1/snapshot":
+                self.send_json(handle_snapshot_request(body))
                 return
             if self.path == "/v1/message":
                 self.send_json(handle_message_request(body))
@@ -422,7 +443,7 @@ def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
-    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/chat/simple", flush=True)
+    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 

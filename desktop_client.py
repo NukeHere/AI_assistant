@@ -65,6 +65,7 @@ CLIENT_ID = os.getenv("ASSISTANT_CLIENT_ID", "primary-user")
 CONVERSATION_ID = os.getenv("ASSISTANT_CONVERSATION_ID", "default")
 LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_assistant"))
 HISTORY_PATH = LOCAL_DATA_DIR / f"history-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
+SNAPSHOT_PATH = LOCAL_DATA_DIR / f"snapshot-{safe_name(CLIENT_ID)}.json"
 HISTORY_KEEP = int(os.getenv("ASSISTANT_LOCAL_HISTORY_KEEP", "400"))
 
 
@@ -104,6 +105,7 @@ class ChatApp(tk.Tk):
         else:
             self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory.")
         self.after(100, self._poll_results)
+        self.after(300, self._restore_snapshot_async)
 
     def _configure_history_tags(self) -> None:
         self.history.tag_configure("author", font=("TkDefaultFont", 10, "bold"))
@@ -135,6 +137,63 @@ class ChatApp(tk.Tk):
         LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_PATH.write_text(json.dumps(self.chat_log[-HISTORY_KEEP:], ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _snapshot_url(self) -> str | None:
+        stripped = API_URL.rstrip("/")
+        if stripped.endswith("/v1/message"):
+            return stripped[: -len("/v1/message")] + "/v1/snapshot"
+        if stripped.endswith("/v1/history"):
+            return stripped[: -len("/v1/history")] + "/v1/snapshot"
+        return None
+
+    def _restore_snapshot_async(self) -> None:
+        if not SNAPSHOT_PATH.exists() or self._snapshot_url() is None:
+            return
+        thread = threading.Thread(target=self._restore_snapshot, daemon=True)
+        thread.start()
+
+    def _restore_snapshot(self) -> None:
+        try:
+            snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
+            self._snapshot_request({"action": "import", "client_id": CLIENT_ID, "snapshot": snapshot}, timeout=45)
+            self.results.put(("system", "Локальный snapshot памяти синхронизирован с сервером."))
+        except (OSError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
+            return
+
+    def _backup_snapshot_async(self) -> None:
+        if self._snapshot_url() is None:
+            return
+        thread = threading.Thread(target=self._backup_snapshot, daemon=True)
+        thread.start()
+
+    def _backup_snapshot(self) -> None:
+        try:
+            data = self._snapshot_request({"action": "export", "client_id": CLIENT_ID}, timeout=45)
+            snapshot = data.get("snapshot")
+            if isinstance(snapshot, dict):
+                LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                SNAPSHOT_PATH.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
+            return
+
+    def _snapshot_request(self, payload_body: dict[str, object], timeout: int) -> dict[str, object]:
+        snapshot_url = self._snapshot_url()
+        if snapshot_url is None:
+            raise ValueError("Snapshot endpoint is unavailable for this API_URL")
+        payload = json.dumps(payload_body, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            snapshot_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Snapshot response must be an object")
+        return data
     def _handle_enter(self, event: object | None = None) -> str:
         return self.send_message(event)
 
@@ -202,6 +261,7 @@ class ChatApp(tk.Tk):
             persona = data.get("persona")
             if isinstance(persona, str):
                 self.persona = persona
+            self._backup_snapshot_async()
             self.results.put(("assistant", data["text"]))
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
@@ -219,12 +279,13 @@ class ChatApp(tk.Tk):
         self._set_waiting(False)
         if kind == "assistant":
             self._append(self.persona, text)
+        elif kind == "system":
+            self._append("Система", text, persist=False)
         else:
             messagebox.showerror("Ошибка запроса", text)
             self._append("Ошибка", text)
 
         self.after(100, self._poll_results)
-
     def _append(self, author: str, text: str, persist: bool = True) -> None:
         if persist:
             self.chat_log.append({"author": author, "text": text})
