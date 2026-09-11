@@ -15,6 +15,7 @@ from app.personas import (
     detect_persona_switch,
     extract_alien_glossary_terms,
 )
+from app.message_blocks import parse_render_blocks
 from app.smart_memory import (
     MEMORY_DIRECTIVE_PROMPT,
     build_memory_context,
@@ -62,6 +63,36 @@ def handle_history_request(body: dict[str, object]) -> dict[str, object]:
     }
 
 
+def response_payload(
+    conversation_id: str,
+    persona: str,
+    text: str,
+    **extra: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "conversation_id": conversation_id,
+        "persona": persona,
+        "text": text,
+        "render_blocks": parse_render_blocks(persona, text),
+    }
+    payload.update(extra)
+    return payload
+
+
+def handle_sync_request(body: dict[str, object]) -> dict[str, object]:
+    client_id = str(body.get("client_id") or DEFAULT_CLIENT_ID).strip()
+    conversation_id = str(body.get("conversation_id") or DEFAULT_CONVERSATION_ID).strip()
+    limit = int(body.get("limit") or CLIENT_HISTORY_LIMIT)
+    events = body.get("messages") or body.get("events") or []
+    if not client_id:
+        raise ValueError("client_id is required")
+    if not conversation_id:
+        raise ValueError("conversation_id is required")
+    if not isinstance(events, list):
+        raise ValueError("messages/events must be an array")
+    return storage.sync_messages(client_id, conversation_id, events, limit=limit)
+
+
 def handle_snapshot_request(body: dict[str, object]) -> dict[str, object]:
     client_id = str(body.get("client_id") or DEFAULT_CLIENT_ID).strip()
     action = str(body.get("action") or "export").strip().lower()
@@ -101,16 +132,16 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
         else:
             answer = "Запись добавлена в память. Буду учитывать это в следующих ответах."
         storage.add_message(conversation_id, "assistant", answer)
-        return {
-            "conversation_id": conversation_id,
-            "persona": persona.value,
-            "switched": False,
-            "memory_updated": True,
-            "memory_saved": 1,
-            "memory_recalled": 0,
-            "text": answer,
-            "model_mode": provider_mode(),
-        }
+        return response_payload(
+            conversation_id,
+            persona.value,
+            answer,
+            switched=False,
+            memory_updated=True,
+            memory_saved=1,
+            memory_recalled=0,
+            model_mode=provider_mode(),
+        )
 
     if lower in {"/functions", "/capabilities", "функции", "что ты умеешь"} or lower.startswith("что ты можешь"):
         storage.add_message(conversation_id, "user", text)
@@ -138,16 +169,16 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
                 lines.append(f"{index}. {memory['summary']}")
             answer = "\n".join(lines)
         storage.add_message(conversation_id, "assistant", answer)
-        return {
-            "conversation_id": conversation_id,
-            "persona": persona.value,
-            "switched": False,
-            "memory_updated": False,
-            "memory_saved": 0,
-            "memory_recalled": 0,
-            "text": answer,
-            "model_mode": provider_mode(),
-        }
+        return response_payload(
+            conversation_id,
+            persona.value,
+            answer,
+            switched=False,
+            memory_updated=False,
+            memory_saved=0,
+            memory_recalled=0,
+            model_mode=provider_mode(),
+        )
 
     return None
 
@@ -234,15 +265,15 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         storage.add_message(conversation_id, "user", text)
         answer = confirmation_for(switched_persona)
         storage.add_message(conversation_id, "assistant", answer)
-        return {
-            "conversation_id": conversation_id,
-            "persona": switched_persona.value,
-            "switched": True,
-            "memory_saved": 0,
-            "memory_recalled": 0,
-            "text": answer,
-            "model_mode": provider_mode(),
-        }
+        return response_payload(
+            conversation_id,
+            switched_persona.value,
+            answer,
+            switched=True,
+            memory_saved=0,
+            memory_recalled=0,
+            model_mode=provider_mode(),
+        )
 
     memory_response = handle_memory_command(client_id, conversation_id, text, active_persona)
     if memory_response is not None:
@@ -256,16 +287,16 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     answer, model_mode, saved, recalled = complete_with_smart_memory(client_id, conversation_id, messages)
     storage.add_message(conversation_id, "assistant", answer)
 
-    return {
-        "conversation_id": conversation_id,
-        "persona": active_persona.value,
-        "switched": False,
-        "memory_updated": saved > 0,
-        "memory_saved": saved,
-        "memory_recalled": recalled,
-        "text": answer,
-        "model_mode": model_mode,
-    }
+    return response_payload(
+        conversation_id,
+        active_persona.value,
+        answer,
+        switched=False,
+        memory_updated=saved > 0,
+        memory_saved=saved,
+        memory_recalled=recalled,
+        model_mode=model_mode,
+    )
 
 
 def complete_openai_compatible(messages: list[dict[str, str]]) -> str:
@@ -368,12 +399,14 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "message_endpoint": "/v1/message",
                 "history_endpoint": "/v1/history",
                 "snapshot_endpoint": "/v1/snapshot",
+                "sync_endpoint": "/v1/sync",
                 "smart_memory": True,
+                "render_blocks": True,
             }
         )
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot"}:
+        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync"}:
             self.send_json({"error": "Not found"}, status=404)
             return
         if not self.authorized():
@@ -392,6 +425,9 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/v1/snapshot":
                 self.send_json(handle_snapshot_request(body))
+                return
+            if self.path == "/v1/sync":
+                self.send_json(handle_sync_request(body))
                 return
             if self.path == "/v1/message":
                 self.send_json(handle_message_request(body))
@@ -443,7 +479,7 @@ def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
-    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/chat/simple", flush=True)
+    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 

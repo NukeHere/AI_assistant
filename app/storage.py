@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -74,6 +75,12 @@ class Storage:
                 """
             )
             self._ensure_column(conn, "memory_cells", "embedding_json", "text not null default '[]'")
+            self._ensure_column(conn, "messages", "message_uid", "text")
+            self._ensure_column(conn, "messages", "device_id", "text not null default ''")
+            self._ensure_column(conn, "messages", "client_created_at", "text")
+            self._ensure_column(conn, "messages", "content_hash", "text not null default ''")
+            conn.execute("create unique index if not exists idx_messages_uid on messages (message_uid) where message_uid is not null")
+            conn.execute("create index if not exists idx_messages_conversation_created on messages (conversation_id, created_at, id)")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
@@ -114,22 +121,87 @@ class Storage:
                 (persona.value, conversation_id),
             )
 
-    def add_message(self, conversation_id: str, role: str, content: str) -> None:
+    def add_message(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        message_uid: str | None = None,
+        device_id: str = "server",
+        client_created_at: str | None = None,
+    ) -> dict[str, Any]:
+        content_hash = self.message_hash(conversation_id, role, content)
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "insert into messages (conversation_id, role, content) values (?, ?, ?)",
-                (conversation_id, role, content),
+            if message_uid:
+                existing = conn.execute(
+                    "select * from messages where message_uid = ? limit 1",
+                    (message_uid,),
+                ).fetchone()
+                if existing is not None:
+                    return dict(existing)
+            cursor = conn.execute(
+                """
+                insert into messages (conversation_id, role, content, message_uid, device_id, client_created_at, content_hash)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (conversation_id, role, content, message_uid, device_id, client_created_at, content_hash),
             )
+            row_id = int(cursor.lastrowid)
+            if not message_uid:
+                message_uid = f"srv-{conversation_id}-{row_id}"
+                conn.execute("update messages set message_uid = ? where id = ?", (message_uid, row_id))
             conn.execute(
                 "update conversations set updated_at = current_timestamp where id = ?",
                 (conversation_id,),
             )
+            row = conn.execute("select * from messages where id = ?", (row_id,)).fetchone()
+        return dict(row)
 
-    def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, str]]:
+    def upsert_message_event(self, client_id: str, event: dict[str, Any]) -> bool:
+        conversation_id = str(event.get("conversation_id") or "default").strip()
+        role = str(event.get("role") or "").strip()
+        content = str(event.get("content") or "")
+        if not conversation_id or role not in {"system", "user", "assistant"} or not content:
+            return False
+        self.ensure_conversation(client_id, conversation_id)
+        message_uid = str(event.get("message_id") or event.get("message_uid") or "").strip() or None
+        created_at = str(event.get("created_at") or "").strip() or None
+        device_id = str(event.get("device_id") or "unknown").strip()[:128]
+        client_created_at = str(event.get("client_created_at") or created_at or "").strip() or None
+        content_hash = self.message_hash(conversation_id, role, content)
+        if not message_uid:
+            seed = "|".join([conversation_id, role, content_hash, client_created_at or ""])
+            message_uid = "evt-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                """
+                select 1 from messages
+                 where message_uid = ? or (conversation_id = ? and role = ? and content_hash = ? and coalesce(client_created_at, created_at, '') = ?)
+                 limit 1
+                """,
+                (message_uid, conversation_id, role, content_hash, client_created_at or ""),
+            ).fetchone()
+            if existing is not None:
+                return False
+            conn.execute(
+                """
+                insert into messages (conversation_id, role, content, created_at, message_uid, device_id, client_created_at, content_hash)
+                values (?, ?, ?, coalesce(?, current_timestamp), ?, ?, ?, ?)
+                """,
+                (conversation_id, role, content, created_at, message_uid, device_id, client_created_at, content_hash),
+            )
+            conn.execute(
+                "update conversations set updated_at = max(updated_at, coalesce(?, current_timestamp)) where id = ?",
+                (created_at, conversation_id),
+            )
+        return True
+
+    def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                select role, content
+                select message_uid as message_id, conversation_id, role, content,
+                       created_at, device_id, client_created_at, content_hash
                   from messages
                  where conversation_id = ?
                  order by id desc
@@ -400,6 +472,9 @@ class Storage:
                 role = str(item.get("role") or "").strip()
                 content = str(item.get("content") or "")
                 created_at = str(item.get("created_at") or "")
+                message_uid = str(item.get("message_id") or item.get("message_uid") or "").strip() or None
+                device_id = str(item.get("device_id") or "snapshot").strip()[:128]
+                client_created_at = str(item.get("client_created_at") or created_at or "").strip() or None
                 if not conversation_id or role not in {"user", "assistant", "system"} or not content:
                     continue
                 conn.execute(
@@ -410,24 +485,28 @@ class Storage:
                     """,
                     (conversation_id, client_id, Persona.ANA.value),
                 )
+                content_hash = self.message_hash(conversation_id, role, content)
+                if not message_uid:
+                    seed = "|".join([conversation_id, role, content_hash, client_created_at or created_at or ""])
+                    message_uid = "snap-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
                 exists = conn.execute(
                     """
                     select 1 from messages
-                     where conversation_id = ? and role = ? and content = ? and created_at = ?
+                     where message_uid = ?
+                        or (conversation_id = ? and role = ? and content_hash = ? and coalesce(client_created_at, created_at, '') = ?)
                      limit 1
                     """,
-                    (conversation_id, role, content, created_at),
+                    (message_uid, conversation_id, role, content_hash, client_created_at or created_at or ""),
                 ).fetchone()
                 if exists is None:
                     conn.execute(
                         """
-                        insert into messages (conversation_id, role, content, created_at)
-                        values (?, ?, ?, coalesce(?, current_timestamp))
+                        insert into messages (conversation_id, role, content, created_at, message_uid, device_id, client_created_at, content_hash)
+                        values (?, ?, ?, coalesce(?, current_timestamp), ?, ?, ?, ?)
                         """,
-                        (conversation_id, role, content, created_at or None),
+                        (conversation_id, role, content, created_at or None, message_uid, device_id, client_created_at, content_hash),
                     )
                     counts["messages"] += 1
-
             for item in memories:
                 if not isinstance(item, dict):
                     continue
@@ -506,6 +585,47 @@ class Storage:
                         (kind, full_content, topics_json, embedding_json, importance, existing["id"]),
                     )
         return counts
+
+    def sync_messages(
+        self,
+        client_id: str,
+        conversation_id: str,
+        events: list[dict[str, Any]],
+        limit: int = 400,
+    ) -> dict[str, Any]:
+        self.ensure_conversation(client_id, conversation_id)
+        imported = 0
+        for event in events:
+            if isinstance(event, dict):
+                event = dict(event)
+                event.setdefault("conversation_id", conversation_id)
+                if self.upsert_message_event(client_id, event):
+                    imported += 1
+        conversation = self.ensure_conversation(client_id, conversation_id)
+        return {
+            "ok": True,
+            "conversation_id": conversation_id,
+            "persona": conversation["persona"],
+            "imported": imported,
+            "messages": self.recent_messages(conversation_id, limit),
+            "state": self.conversation_state(conversation_id),
+        }
+
+    def conversation_state(self, conversation_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                select count(*) as message_count, max(created_at) as last_message_at, max(id) as revision
+                  from messages
+                 where conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else {"message_count": 0, "last_message_at": None, "revision": 0}
+
+    @staticmethod
+    def message_hash(conversation_id: str, role: str, content: str) -> str:
+        return hashlib.sha256("\n".join([conversation_id, role, content]).encode("utf-8")).hexdigest()
     def _memory_rows(self, client_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             return [

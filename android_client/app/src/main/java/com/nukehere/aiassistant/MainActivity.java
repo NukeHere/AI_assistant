@@ -26,16 +26,28 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.security.MessageDigest;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String PREFS = "ai_assistant_prefs";
     private static final String DEFAULT_URL = "https://ai-assistant-4yn0.onrender.com/v1/message";
     private static final String CLIENT_ID = "primary-user";
     private static final String CONVERSATION_ID = "default";
+    private static final String DEVICE_ID = "android-" + android.os.Build.MODEL.replaceAll("[^a-zA-Z0-9_.-]+", "_");
+    private static final int HISTORY_KEEP = 400;
     private static final Pattern STRUCTURED_LINE = Pattern.compile(
             "^\\s*(?:[-*]\\s*)?(?:\\*\\*)?(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)(?:\\*\\*)?\\s*:\\s*(.*)$",
             Pattern.CASE_INSENSITIVE
@@ -44,7 +56,6 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-
     private EditText apiUrlInput;
     private EditText tokenInput;
     private ScrollView scrollView;
@@ -52,24 +63,28 @@ public class MainActivity extends Activity {
     private EditText messageInput;
     private Button sendButton;
     private String persona = "ANA";
+    private final List<JSONObject> events = new ArrayList<>();
+    private boolean syncRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        setContentView(buildLayout());
-        historyView.setText(prefs.getString("history", "Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /functions.\n\n"));
-        scrollToBottom();
-        syncHistory();
+        events.addAll(loadEvents());
+        buildUi();
+        renderHistory();
+        syncHistory(false);
     }
 
-    private View buildLayout() {
+    private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(20, 20, 20, 20);
+        root.setPadding(12, 12, 12, 12);
+        setContentView(root);
 
         apiUrlInput = new EditText(this);
         apiUrlInput.setSingleLine(true);
+        apiUrlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         apiUrlInput.setText(prefs.getString("api_url", DEFAULT_URL));
         apiUrlInput.setHint("Server URL");
         root.addView(apiUrlInput, matchWrap());
@@ -87,15 +102,12 @@ public class MainActivity extends Activity {
 
         Button saveButton = new Button(this);
         saveButton.setText("Save");
-        saveButton.setOnClickListener(v -> {
-            saveSettings();
-            syncHistory();
-        });
+        saveButton.setOnClickListener(v -> { saveSettings(); syncHistory(true); });
         topButtons.addView(saveButton, weightedButton());
 
         Button syncButton = new Button(this);
         syncButton.setText("Sync");
-        syncButton.setOnClickListener(v -> syncHistory());
+        syncButton.setOnClickListener(v -> syncHistory(true));
         topButtons.addView(syncButton, weightedButton());
 
         Button downButton = new Button(this);
@@ -121,11 +133,7 @@ public class MainActivity extends Activity {
 
         scrollView = new ScrollView(this);
         scrollView.addView(historyView);
-        root.addView(scrollView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        ));
+        root.addView(scrollView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
 
         messageInput = new EditText(this);
         messageInput.setMinLines(2);
@@ -138,204 +146,300 @@ public class MainActivity extends Activity {
         sendButton.setTypeface(Typeface.DEFAULT_BOLD);
         sendButton.setOnClickListener(v -> sendCurrentText());
         root.addView(sendButton, matchWrap());
-
-        return root;
     }
 
     private LinearLayout.LayoutParams matchWrap() {
-        return new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
+        return new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     }
 
     private LinearLayout.LayoutParams weightedButton() {
-        return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
     }
 
     private void saveSettings() {
-        saveSettings(true);
-    }
-
-    private void saveSettings(boolean showToast) {
         prefs.edit()
                 .putString("api_url", apiUrlInput.getText().toString().trim())
                 .putString("api_token", tokenInput.getText().toString().trim())
                 .apply();
-        if (showToast) {
-            Toast.makeText(this, "Настройки сохранены", Toast.LENGTH_SHORT).show();
-        }
     }
 
-    private void syncHistory() {
-        saveSettings(false);
-        executor.execute(this::requestHistory);
-    }
-
-    private void requestHistory() {
+    private List<JSONObject> loadEvents() {
+        List<JSONObject> loaded = new ArrayList<>();
+        String raw = prefs.getString("events", "[]");
         try {
-            String historyUrl = endpointUrl("/v1/history");
-            String apiToken = requireToken();
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                JSONObject item = array.optJSONObject(i);
+                if (item != null) loaded.add(normalizeEvent(item));
+            }
+        } catch (Exception ignored) {
+            String legacy = prefs.getString("history", "");
+            if (!legacy.isEmpty()) {
+                loaded.add(makeEvent("system", "Система", "Старая локальная история сохранена как текст. Новые сообщения синхронизируются по событиям."));
+            }
+        }
+        return loaded;
+    }
+
+    private void saveEvents() {
+        JSONArray array = new JSONArray();
+        int start = Math.max(0, events.size() - HISTORY_KEEP);
+        for (int i = start; i < events.size(); i++) array.put(events.get(i));
+        prefs.edit().putString("events", array.toString()).apply();
+    }
+
+    private void syncHistory(boolean showToast) {
+        if (syncRunning) return;
+        String token = tokenInput.getText().toString().trim();
+        if (token.isEmpty()) return;
+        syncRunning = true;
+        executor.execute(() -> requestSync(showToast, token));
+    }
+
+    private void requestSync(boolean showToast, String apiToken) {
+        try {
             JSONObject body = new JSONObject();
             body.put("client_id", CLIENT_ID);
             body.put("conversation_id", CONVERSATION_ID);
-            body.put("limit", 200);
-
-            JSONObject response = postJson(historyUrl, apiToken, body, 45000);
-            persona = response.optString("persona", persona);
-            JSONArray messages = response.optJSONArray("messages");
-            if (messages == null || messages.length() == 0) {
-                return;
+            body.put("device_id", DEVICE_ID);
+            body.put("limit", HISTORY_KEEP);
+            JSONArray messages = new JSONArray();
+            for (JSONObject event : events) {
+                if (!"system".equals(event.optString("role"))) messages.put(toServerEvent(event));
             }
-            String rendered = renderServerMessages(messages);
-            int remoteCount = countRenderedMessages(rendered);
+            body.put("messages", messages);
+            JSONObject response = postJson(endpointUrl("/v1/sync"), apiToken, body, 45000);
             mainHandler.post(() -> {
-                String current = historyView.getText().toString();
-                int localCount = countRenderedMessages(current);
-                if (remoteCount < localCount) {
-                    return;
-                }
-                if (!rendered.equals(current)) {
-                    historyView.setText(rendered);
-                    prefs.edit().putString("history", rendered).apply();
-                    scrollToBottom();
-                }
+                syncRunning = false;
+                mergeServerMessages(response);
+                if (showToast) Toast.makeText(this, "Синхронизация завершена", Toast.LENGTH_SHORT).show();
             });
-        } catch (Exception ignored) {
-            // Keep local history when offline or when token is not set yet.
+        } catch (Exception error) {
+            mainHandler.post(() -> {
+                syncRunning = false;
+                if (showToast) Toast.makeText(this, "Sync: " + error.getMessage(), Toast.LENGTH_LONG).show();
+            });
         }
-    }
-
-    private String renderServerMessages(JSONArray messages) {
-        StringBuilder rendered = new StringBuilder();
-        for (int i = 0; i < messages.length(); i++) {
-            JSONObject item = messages.optJSONObject(i);
-            if (item == null) {
-                continue;
-            }
-            String role = item.optString("role", "");
-            String content = item.optString("content", "");
-            if (content.isEmpty()) {
-                continue;
-            }
-            String author = role.equals("user") ? "Вы" : persona;
-            rendered.append(renderMessage(author, content));
-        }
-        return rendered.toString();
     }
 
     private void sendCurrentText() {
         String text = messageInput.getText().toString().trim();
-        if (text.isEmpty()) {
-            return;
-        }
+        if (text.isEmpty()) return;
         messageInput.setText("");
         sendText(text);
     }
 
     private void sendText(String text) {
-        saveSettings(false);
-        appendLine("Вы", text);
+        saveSettings();
+        JSONObject userEvent = makeEvent("user", "Вы", text);
+        events.add(userEvent);
+        saveEvents();
+        renderHistory();
         setWaiting(true);
         executor.execute(() -> requestAnswer(text));
     }
 
     private void requestAnswer(String text) {
         try {
-            String apiUrl = prefs.getString("api_url", DEFAULT_URL);
             String apiToken = requireToken();
-
             JSONObject body = new JSONObject();
             body.put("client_id", CLIENT_ID);
             body.put("conversation_id", CONVERSATION_ID);
             body.put("text", text);
             body.put("input_type", "text");
-
-            JSONObject response = postJson(apiUrl, apiToken, body, 90000);
-            String responsePersona = response.optString("persona", persona);
-            String answer = response.getString("text");
+            JSONObject response = postJson(apiUrlInput.getText().toString().trim(), apiToken, body, 120000);
+            String newPersona = response.optString("persona", persona);
+            String answer = response.optString("text", "");
             mainHandler.post(() -> {
-                persona = responsePersona;
-                appendLine(persona, answer);
+                persona = newPersona;
+                events.add(makeEvent("assistant", persona, answer));
+                List<JSONObject> compacted = mergeEvents(events, Collections.emptyList());
+                events.clear();
+                events.addAll(compacted);
+                saveEvents();
+                renderHistory();
                 setWaiting(false);
-                syncHistory();
+                syncHistory(false);
             });
         } catch (Exception error) {
             mainHandler.post(() -> {
-                appendLine("Ошибка", error.getMessage() == null ? error.toString() : error.getMessage());
+                events.add(makeEvent("system", "Ошибка", error.getMessage() == null ? error.toString() : error.getMessage()));
+                saveEvents();
+                renderHistory();
                 setWaiting(false);
             });
         }
     }
 
-    private String requireToken() {
-        String apiToken = prefs.getString("api_token", "");
-        if (apiToken == null || apiToken.trim().isEmpty()) {
-            throw new IllegalStateException("APP_API_TOKEN не задан в настройках Android-клиента");
-        }
-        return apiToken.trim();
-    }
-
-    private String endpointUrl(String endpoint) {
-        String apiUrl = prefs.getString("api_url", DEFAULT_URL);
-        if (apiUrl == null) {
-            apiUrl = DEFAULT_URL;
-        }
-        String stripped = apiUrl.trim();
-        String[] suffixes = {"/v1/message", "/v1/history", "/v1/snapshot", "/v1/chat/simple"};
-        for (String suffix : suffixes) {
-            if (stripped.endsWith(suffix)) {
-                return stripped.substring(0, stripped.length() - suffix.length()) + endpoint;
-            }
-        }
-        return stripped.replaceAll("/+$", "") + endpoint;
-    }
-
-    private JSONObject postJson(String url, String apiToken, JSONObject body, int timeoutMs) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+    private JSONObject postJson(String urlText, String apiToken, JSONObject body, int timeoutMs) throws Exception {
+        URL url = new URL(urlText);
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
         connection.setRequestMethod("POST");
-        connection.setConnectTimeout(30000);
+        connection.setConnectTimeout(timeoutMs);
         connection.setReadTimeout(timeoutMs);
+        connection.setDoOutput(true);
         connection.setRequestProperty("Authorization", "Bearer " + apiToken);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        connection.setDoOutput(true);
-
-        try (OutputStream output = connection.getOutputStream()) {
-            output.write(body.toString().getBytes(StandardCharsets.UTF_8));
-        }
-
+        byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+        try (OutputStream output = connection.getOutputStream()) { output.write(bytes); }
         int code = connection.getResponseCode();
-        String raw = readAll(code >= 400 ? connection.getErrorStream() : connection.getInputStream());
-        if (code >= 400) {
-            throw new IllegalStateException("HTTP " + code + ": " + raw);
-        }
-        return new JSONObject(raw);
+        InputStream stream = code >= 200 && code < 300 ? connection.getInputStream() : connection.getErrorStream();
+        String response = readAll(stream);
+        if (code < 200 || code >= 300) throw new RuntimeException("HTTP " + code + ": " + response);
+        return new JSONObject(response);
     }
 
     private String readAll(InputStream stream) throws Exception {
-        if (stream == null) {
-            return "";
-        }
+        if (stream == null) return "";
         StringBuilder builder = new StringBuilder();
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             String line;
-            while ((line = reader.readLine()) != null) {
-                builder.append(line).append('\n');
-            }
+            while ((line = reader.readLine()) != null) builder.append(line);
         }
-        return builder.toString().trim();
+        return builder.toString();
     }
 
-    private void appendLine(String author, String text) {
-        String current = historyView.getText().toString();
-        String next = current + renderMessage(author, text);
-        historyView.setText(next);
-        prefs.edit().putString("history", next).apply();
+    private String endpointUrl(String endpoint) {
+        String stripped = apiUrlInput.getText().toString().trim();
+        String[] suffixes = {"/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync", "/v1/chat/simple"};
+        for (String suffix : suffixes) {
+            if (stripped.endsWith(suffix)) return stripped.substring(0, stripped.length() - suffix.length()) + endpoint;
+        }
+        return stripped + endpoint;
+    }
+
+    private String requireToken() {
+        String token = tokenInput.getText().toString().trim();
+        if (token.isEmpty()) throw new IllegalStateException("APP_API_TOKEN пустой");
+        return token;
+    }
+
+    private void mergeServerMessages(JSONObject response) {
+        persona = response.optString("persona", persona);
+        JSONArray messages = response.optJSONArray("messages");
+        if (messages == null) return;
+        List<JSONObject> remote = new ArrayList<>();
+        for (int i = 0; i < messages.length(); i++) {
+            JSONObject item = messages.optJSONObject(i);
+            if (item == null) continue;
+            String role = item.optString("role", "");
+            if (!role.equals("user") && !role.equals("assistant")) continue;
+            String author = role.equals("user") ? "Вы" : persona;
+            JSONObject event = new JSONObject();
+            try {
+                event.put("message_id", item.optString("message_id", ""));
+                event.put("conversation_id", item.optString("conversation_id", CONVERSATION_ID));
+                event.put("role", role);
+                event.put("author", author);
+                event.put("text", item.optString("content", ""));
+                event.put("created_at", item.optString("created_at", nowUtc()));
+                event.put("client_created_at", item.optString("client_created_at", item.optString("created_at", nowUtc())));
+                event.put("device_id", item.optString("device_id", "server"));
+                remote.add(normalizeEvent(event));
+            } catch (Exception ignored) {}
+        }
+        List<JSONObject> merged = mergeEvents(events, remote);
+        events.clear();
+        events.addAll(merged);
+        saveEvents();
+        renderHistory();
+    }
+
+    private List<JSONObject> mergeEvents(List<JSONObject> local, List<JSONObject> remote) {
+        List<JSONObject> merged = new ArrayList<>();
+        HashSet<String> seenIds = new HashSet<>();
+        HashSet<String> seenHashes = new HashSet<>();
+        for (JSONObject source : local) addMerged(merged, seenIds, seenHashes, source);
+        for (JSONObject source : remote) addMerged(merged, seenIds, seenHashes, source);
+        Collections.sort(merged, (a, b) -> {
+            int byDate = a.optString("created_at", "").compareTo(b.optString("created_at", ""));
+            if (byDate != 0) return byDate;
+            return a.optString("message_id", "").compareTo(b.optString("message_id", ""));
+        });
+        if (merged.size() > HISTORY_KEEP) return new ArrayList<>(merged.subList(merged.size() - HISTORY_KEEP, merged.size()));
+        return merged;
+    }
+
+    private void addMerged(List<JSONObject> merged, HashSet<String> seenIds, HashSet<String> seenHashes, JSONObject raw) {
+        try {
+            JSONObject item = normalizeEvent(raw);
+            String messageId = item.optString("message_id", "");
+            String hash = item.optString("conversation_id") + "|" + item.optString("role") + "|" + sha256(item.optString("text"));
+            if (seenIds.contains(messageId) || seenHashes.contains(hash)) return;
+            seenIds.add(messageId);
+            seenHashes.add(hash);
+            merged.add(item);
+        } catch (Exception ignored) {}
+    }
+
+    private JSONObject makeEvent(String role, String author, String text) {
+        JSONObject event = new JSONObject();
+        try {
+            String createdAt = nowUtc();
+            event.put("message_id", DEVICE_ID + "-" + UUID.randomUUID().toString().replace("-", ""));
+            event.put("conversation_id", CONVERSATION_ID);
+            event.put("role", role);
+            event.put("author", author);
+            event.put("text", text);
+            event.put("created_at", createdAt);
+            event.put("client_created_at", createdAt);
+            event.put("device_id", DEVICE_ID);
+        } catch (Exception ignored) {}
+        return event;
+    }
+
+    private JSONObject normalizeEvent(JSONObject raw) throws Exception {
+        JSONObject event = new JSONObject();
+        String role = raw.optString("role", roleForAuthor(raw.optString("author", "Система")));
+        String text = raw.optString("text", raw.optString("content", ""));
+        String createdAt = raw.optString("created_at", raw.optString("client_created_at", nowUtc()));
+        String messageId = raw.optString("message_id", raw.optString("message_uid", ""));
+        if (messageId.isEmpty()) messageId = "android-local-" + sha256(CONVERSATION_ID + role + text + createdAt).substring(0, 32);
+        event.put("message_id", messageId);
+        event.put("conversation_id", raw.optString("conversation_id", CONVERSATION_ID));
+        event.put("role", role);
+        event.put("author", raw.optString("author", authorForRole(role)));
+        event.put("text", text);
+        event.put("created_at", createdAt);
+        event.put("client_created_at", raw.optString("client_created_at", createdAt));
+        event.put("device_id", raw.optString("device_id", DEVICE_ID));
+        return event;
+    }
+
+    private JSONObject toServerEvent(JSONObject event) throws Exception {
+        JSONObject out = new JSONObject();
+        out.put("message_id", event.optString("message_id"));
+        out.put("conversation_id", event.optString("conversation_id", CONVERSATION_ID));
+        out.put("role", event.optString("role"));
+        out.put("content", event.optString("text"));
+        out.put("created_at", event.optString("created_at"));
+        out.put("client_created_at", event.optString("client_created_at"));
+        out.put("device_id", event.optString("device_id", DEVICE_ID));
+        return out;
+    }
+
+    private String roleForAuthor(String author) {
+        if (author.equals("Вы")) return "user";
+        if (author.equals("ANA") || author.equals("ALIEN")) return "assistant";
+        return "system";
+    }
+
+    private String authorForRole(String role) {
+        if (role.equals("user")) return "Вы";
+        if (role.equals("assistant")) return persona;
+        return "Система";
+    }
+
+    private void renderHistory() {
+        StringBuilder builder = new StringBuilder();
+        if (events.isEmpty()) builder.append("Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /functions.\n\n");
+        for (JSONObject event : events) {
+            String author = event.optString("author", authorForRole(event.optString("role", "system")));
+            String text = event.optString("text", "");
+            builder.append(author).append(":\n").append(decorateStructuredText(author, text)).append("\n\n");
+        }
+        historyView.setText(builder.toString());
         scrollToBottom();
-    }
-
-    private String renderMessage(String author, String text) {
-        return author + ":\n" + decorateStructuredText(author, text) + "\n\n";
     }
 
     private String decorateStructuredText(String author, String text) {
@@ -346,9 +450,7 @@ public class MainActivity extends Activity {
             if (matcher.matches()) {
                 builder.append("▌ ").append(labelFor(author, matcher.group(1))).append('\n');
                 String rest = cleanMarkdown(matcher.group(2).trim());
-                if (!rest.isEmpty()) {
-                    builder.append("  ").append(rest).append('\n');
-                }
+                if (!rest.isEmpty()) builder.append("  ").append(rest).append('\n');
             } else {
                 builder.append(cleanMarkdown(line)).append('\n');
             }
@@ -357,7 +459,7 @@ public class MainActivity extends Activity {
     }
 
     private String labelFor(String author, String label) {
-        String key = label.toLowerCase();
+        String key = label.toLowerCase(Locale.ROOT);
         boolean alien = author.equals("ALIEN");
         if (key.equals("observation")) return alien ? "СИГНАЛ" : "НАБЛЮДЕНИЕ";
         if (key.equals("diagnostic") || key.equals("diagnosis")) return alien ? "ДИССОНАНС" : "ДИАГНОСТИКА";
@@ -365,7 +467,7 @@ public class MainActivity extends Activity {
         if (key.equals("command action")) return alien ? "КОМАНДНАЯ НОТА" : "КОМАНДА";
         if (key.equals("explanation")) return alien ? "ГЛУБИНА" : "ОБЪЯСНЕНИЕ";
         if (key.equals("conclusion")) return alien ? "РЕЗОНАНС" : "ВЫВОД";
-        return label.toUpperCase();
+        return label.toUpperCase(Locale.ROOT);
     }
 
     private String cleanMarkdown(String text) {
@@ -376,38 +478,38 @@ public class MainActivity extends Activity {
         cleaned = cleaned.replaceAll("\\*\\*([^*]+)\\*\\*", "$1");
         cleaned = cleaned.replaceAll("__([^_]+)__", "$1");
         cleaned = cleaned.replaceAll("`([^`]+)`", "$1");
-        cleaned = cleaned.replace("```", "");
-        cleaned = cleaned.replace("**", "").replace("__", "").trim();
-        while (cleaned.startsWith("*") || cleaned.startsWith("_")) {
-            cleaned = cleaned.substring(1).trim();
-        }
-        while (cleaned.endsWith("*") || cleaned.endsWith("_")) {
-            cleaned = cleaned.substring(0, cleaned.length() - 1).trim();
-        }
+        cleaned = cleaned.replace("```", "").replace("**", "").replace("__", "").trim();
+        while (cleaned.startsWith("*") || cleaned.startsWith("_")) cleaned = cleaned.substring(1).trim();
+        while (cleaned.endsWith("*") || cleaned.endsWith("_")) cleaned = cleaned.substring(0, cleaned.length() - 1).trim();
         return cleaned;
     }
 
-    private int countRenderedMessages(String rendered) {
-        int count = 0;
-        String[] lines = rendered.split("\\r?\\n");
-        for (String line : lines) {
-            if (line.equals("Вы:") || line.equals("ANA:") || line.equals("ALIEN:") || line.equals("Ошибка:")) {
-                count++;
-            }
-        }
-        return count;
-    }
-
     private void scrollToBottom() {
-        if (scrollView == null) {
-            return;
-        }
-        scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
+        if (scrollView == null) return;
+        scrollView.postDelayed(() -> scrollView.fullScroll(View.FOCUS_DOWN), 80);
     }
 
     private void setWaiting(boolean waiting) {
         sendButton.setEnabled(!waiting);
         sendButton.setText(waiting ? "Ждём..." : "Отправить");
+    }
+
+    private String nowUtc() {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT);
+        format.setTimeZone(TimeZone.getTimeZone("UTC"));
+        return format.format(new Date());
+    }
+
+    private String sha256(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : hash) hex.append(String.format(Locale.ROOT, "%02x", b));
+            return hex.toString();
+        } catch (Exception error) {
+            return String.valueOf(value.hashCode());
+        }
     }
 
     @Override

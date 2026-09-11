@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
 import re
 import threading
 import tkinter as tk
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, scrolledtext
 from urllib.error import HTTPError, URLError
@@ -30,10 +33,15 @@ def safe_name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("._") or "default"
 
 
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 load_local_env()
 API_URL = os.getenv("ASSISTANT_API_URL", "https://ai-assistant-4yn0.onrender.com/v1/message")
 API_TOKEN = os.getenv("APP_API_TOKEN", "dev-token")
 CLIENT_ID = os.getenv("ASSISTANT_CLIENT_ID", "primary-user")
+DEVICE_ID = os.getenv("ASSISTANT_DEVICE_ID", f"desktop-{safe_name(os.environ.get('COMPUTERNAME', 'windows'))}")
 CONVERSATION_ID = os.getenv("ASSISTANT_CONVERSATION_ID", "default")
 LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_assistant"))
 HISTORY_PATH = LOCAL_DATA_DIR / f"history-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
@@ -45,12 +53,13 @@ class ChatApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("AI Assistant")
-        self.geometry("760x620")
-        self.minsize(520, 420)
+        self.geometry("780x640")
+        self.minsize(540, 440)
 
-        self.results: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.persona = "ANA"
         self.chat_log = self._load_local_history()
+        self._sync_running = False
 
         quick = tk.Frame(self)
         quick.pack(fill=tk.X, padx=12, pady=(8, 0))
@@ -80,11 +89,10 @@ class ChatApp(tk.Tk):
         self.send_button.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.Y)
 
         if self.chat_log:
-            for entry in self.chat_log:
-                self._append(entry.get("author", "Система"), entry.get("text", ""), persist=False)
-            self._append("Система", "Локальная история восстановлена. Сейчас сверю её с сервером.", persist=False)
+            self._render_history()
+            self._append_system("Локальная история восстановлена. Сверяю с сервером.")
         else:
-            self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /functions.")
+            self._append_system("Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /functions.")
         self.after(100, self._poll_results)
         self.after(200, self._sync_history_async)
         self.after(500, self._restore_snapshot_async)
@@ -111,9 +119,36 @@ class ChatApp(tk.Tk):
             return []
         entries: list[dict[str, str]] = []
         for item in data[-HISTORY_KEEP:]:
-            if isinstance(item, dict) and isinstance(item.get("author"), str) and isinstance(item.get("text"), str):
-                entries.append({"author": item["author"], "text": item["text"]})
+            if not isinstance(item, dict):
+                continue
+            entry = self._normalize_entry(item)
+            if entry:
+                entries.append(entry)
         return entries
+
+    def _normalize_entry(self, item: dict[str, object]) -> dict[str, str] | None:
+        author = str(item.get("author") or "")
+        text = str(item.get("text") or item.get("content") or "")
+        role = str(item.get("role") or self._role_for_author(author))
+        if not text or role not in {"system", "user", "assistant"}:
+            return None
+        if not author:
+            author = self._author_for_role(role, str(item.get("persona") or self.persona))
+        created_at = str(item.get("created_at") or item.get("client_created_at") or utc_now())
+        message_id = str(item.get("message_id") or item.get("message_uid") or "")
+        if not message_id:
+            seed = "|".join([CONVERSATION_ID, role, text, created_at])
+            message_id = "local-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+        return {
+            "message_id": message_id,
+            "conversation_id": str(item.get("conversation_id") or CONVERSATION_ID),
+            "role": role,
+            "author": author,
+            "text": text,
+            "created_at": created_at,
+            "client_created_at": str(item.get("client_created_at") or created_at),
+            "device_id": str(item.get("device_id") or DEVICE_ID),
+        }
 
     def _save_local_history(self) -> None:
         LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -121,7 +156,7 @@ class ChatApp(tk.Tk):
 
     def _endpoint_url(self, endpoint: str) -> str | None:
         stripped = API_URL.rstrip("/")
-        for suffix in ["/v1/message", "/v1/history", "/v1/snapshot", "/v1/chat/simple"]:
+        for suffix in ["/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync", "/v1/chat/simple"]:
             if stripped.endswith(suffix):
                 return stripped[: -len(suffix)] + endpoint
         return stripped + endpoint if stripped.startswith("http") else None
@@ -129,83 +164,61 @@ class ChatApp(tk.Tk):
     def _snapshot_url(self) -> str | None:
         return self._endpoint_url("/v1/snapshot")
 
-    def _history_url(self) -> str | None:
-        return self._endpoint_url("/v1/history")
+    def _sync_url(self) -> str | None:
+        return self._endpoint_url("/v1/sync")
 
     def _sync_history_async(self) -> None:
-        if self._history_url() is None:
+        if self._sync_url() is None or self._sync_running:
             return
-        thread = threading.Thread(target=self._sync_history_from_server, daemon=True)
-        thread.start()
+        self._sync_running = True
+        threading.Thread(target=self._sync_history_with_server, daemon=True).start()
 
-    def _sync_history_from_server(self) -> None:
+    def _sync_history_with_server(self) -> None:
         try:
-            data = self._history_request(timeout=45)
-            raw_messages = data.get("messages")
-            if not isinstance(raw_messages, list):
-                return
-            entries: list[dict[str, str]] = []
-            for item in raw_messages:
-                if not isinstance(item, dict):
-                    continue
-                role = item.get("role")
-                content = item.get("content")
-                if not isinstance(role, str) or not isinstance(content, str):
-                    continue
-                if role == "user":
-                    entries.append({"author": "Вы", "text": content})
-                elif role == "assistant":
-                    entries.append({"author": str(data.get("persona") or self.persona), "text": content})
-            if entries:
-                self.results.put(("history", json.dumps(entries[-HISTORY_KEEP:], ensure_ascii=False)))
+            payload = {
+                "client_id": CLIENT_ID,
+                "conversation_id": CONVERSATION_ID,
+                "device_id": DEVICE_ID,
+                "limit": HISTORY_KEEP,
+                "messages": [self._entry_to_event(entry) for entry in self.chat_log if entry.get("role") != "system"],
+            }
+            data = self._post_json(self._sync_url(), payload, timeout=45)
+            self.results.put(("sync", data))
         except (OSError, HTTPError, URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError):
-            return
+            self.results.put(("sync_done", {}))
 
-    def _history_request(self, timeout: int) -> dict[str, object]:
-        history_url = self._history_url()
-        if history_url is None:
-            raise ValueError("History endpoint is unavailable for this API_URL")
-        payload = json.dumps(
-            {"client_id": CLIENT_ID, "conversation_id": CONVERSATION_ID, "limit": HISTORY_KEEP},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        request = Request(
-            history_url,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {API_TOKEN}",
-                "Content-Type": "application/json",
-            },
-        )
-        with urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("History response must be an object")
-        return data
+    def _entry_to_event(self, entry: dict[str, str]) -> dict[str, str]:
+        return {
+            "message_id": entry["message_id"],
+            "conversation_id": entry.get("conversation_id", CONVERSATION_ID),
+            "role": entry["role"],
+            "content": entry["text"],
+            "created_at": entry.get("created_at", utc_now()),
+            "client_created_at": entry.get("client_created_at", entry.get("created_at", utc_now())),
+            "device_id": entry.get("device_id", DEVICE_ID),
+        }
 
     def _restore_snapshot_async(self) -> None:
         if not SNAPSHOT_PATH.exists() or self._snapshot_url() is None:
             return
-        thread = threading.Thread(target=self._restore_snapshot, daemon=True)
-        thread.start()
+        threading.Thread(target=self._restore_snapshot, daemon=True).start()
 
     def _restore_snapshot(self) -> None:
         try:
             snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
-            self._snapshot_request({"action": "import", "client_id": CLIENT_ID, "snapshot": snapshot}, timeout=45)
+            self._post_json(self._snapshot_url(), {"action": "import", "client_id": CLIENT_ID, "snapshot": snapshot}, timeout=45)
+            self._sync_history_with_server()
         except (OSError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
             return
 
     def _backup_snapshot_async(self) -> None:
         if self._snapshot_url() is None:
             return
-        thread = threading.Thread(target=self._backup_snapshot, daemon=True)
-        thread.start()
+        threading.Thread(target=self._backup_snapshot, daemon=True).start()
 
     def _backup_snapshot(self) -> None:
         try:
-            data = self._snapshot_request({"action": "export", "client_id": CLIENT_ID}, timeout=45)
+            data = self._post_json(self._snapshot_url(), {"action": "export", "client_id": CLIENT_ID}, timeout=45)
             snapshot = data.get("snapshot")
             if isinstance(snapshot, dict):
                 LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -213,25 +226,22 @@ class ChatApp(tk.Tk):
         except (OSError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
             return
 
-    def _snapshot_request(self, payload_body: dict[str, object], timeout: int) -> dict[str, object]:
-        snapshot_url = self._snapshot_url()
-        if snapshot_url is None:
-            raise ValueError("Snapshot endpoint is unavailable for this API_URL")
+    def _post_json(self, url: str | None, payload_body: dict[str, object], timeout: int) -> dict[str, object]:
+        if url is None:
+            raise ValueError("Endpoint is unavailable for this API_URL")
         payload = json.dumps(payload_body, ensure_ascii=False).encode("utf-8")
         request = Request(
-            snapshot_url,
+            url,
             data=payload,
             method="POST",
-            headers={
-                "Authorization": f"Bearer {API_TOKEN}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"},
         )
         with urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         if not isinstance(data, dict):
-            raise ValueError("Snapshot response must be an object")
+            raise ValueError("Response must be an object")
         return data
+
     def _handle_enter(self, event: object | None = None) -> str:
         return self.send_message(event)
 
@@ -247,7 +257,6 @@ class ChatApp(tk.Tk):
             selected_text = self.history.get(tk.SEL_FIRST, tk.SEL_LAST)
         except tk.TclError:
             return "break"
-
         self.clipboard_clear()
         self.clipboard_append(selected_text)
         return "break"
@@ -256,103 +265,111 @@ class ChatApp(tk.Tk):
         self.input.delete("1.0", tk.END)
         self.input.insert("1.0", text)
         self.send_message()
+
     def send_message(self, event: object | None = None) -> str:
         text = self.input.get("1.0", tk.END).strip()
         if not text:
             return "break"
-
         self.input.delete("1.0", tk.END)
-        self._append("Вы", text)
+        self._append_entry(self._new_entry("user", "Вы", text))
         self._set_waiting(True)
-
-        thread = threading.Thread(target=self._request_answer, args=(text,), daemon=True)
-        thread.start()
+        threading.Thread(target=self._request_answer, args=(text,), daemon=True).start()
         return "break"
 
     def _request_answer(self, text: str) -> None:
         try:
             if API_URL.rstrip("/").endswith("/v1/chat/simple"):
-                payload_body = {
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a helpful AI assistant. Answer clearly and concisely.",
-                        },
-                        {"role": "user", "content": text},
-                    ]
-                }
+                payload_body = {"messages": [{"role": "system", "content": "You are a helpful AI assistant."}, {"role": "user", "content": text}]}
             else:
-                payload_body = {
-                    "client_id": CLIENT_ID,
-                    "conversation_id": CONVERSATION_ID,
-                    "text": text,
-                    "input_type": "text",
-                }
-            payload = json.dumps(payload_body, ensure_ascii=False).encode("utf-8")
-            request = Request(
-                API_URL,
-                data=payload,
-                method="POST",
-                headers={
-                    "Authorization": f"Bearer {API_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-            )
-            with urlopen(request, timeout=90) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                payload_body = {"client_id": CLIENT_ID, "conversation_id": CONVERSATION_ID, "text": text, "input_type": "text"}
+            data = self._post_json(API_URL, payload_body, timeout=120)
             persona = data.get("persona")
             if isinstance(persona, str):
                 self.persona = persona
+            answer = str(data.get("text") or "")
+            self.results.put(("assistant", {"text": answer, "persona": self.persona, "blocks": data.get("render_blocks")}))
             self._backup_snapshot_async()
-            self.results.put(("assistant", data["text"]))
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
             self.results.put(("error", f"HTTP {error.code}: {details}"))
-        except (URLError, TimeoutError, OSError) as error:
+        except (URLError, TimeoutError, OSError, ValueError) as error:
             self.results.put(("error", str(error)))
 
     def _poll_results(self) -> None:
         try:
-            kind, text = self.results.get_nowait()
+            kind, payload = self.results.get_nowait()
         except queue.Empty:
             self.after(100, self._poll_results)
             return
 
-        self._set_waiting(False)
-        if kind == "assistant":
-            self._append(self.persona, text)
-        elif kind == "history":
-            self._merge_history(json.loads(text))
-        elif kind == "system":
-            self._append("Система", text, persist=False)
+        if kind in {"assistant", "error"}:
+            self._set_waiting(False)
+        if kind == "assistant" and isinstance(payload, dict):
+            self._append_entry(self._new_entry("assistant", str(payload.get("persona") or self.persona), str(payload.get("text") or "")))
+            self._sync_history_async()
+        elif kind == "sync" and isinstance(payload, dict):
+            self._sync_running = False
+            self._merge_server_messages(payload)
+        elif kind == "sync_done":
+            self._sync_running = False
+        elif kind == "system" and isinstance(payload, str):
+            self._append_system(payload)
         else:
-            messagebox.showerror("Ошибка запроса", text)
-            self._append("Ошибка", text)
+            self._set_waiting(False)
+            messagebox.showerror("Ошибка запроса", str(payload))
+            self._append_entry(self._new_entry("system", "Ошибка", str(payload)))
 
         self.after(100, self._poll_results)
 
-    def _merge_history(self, entries: list[dict[str, str]]) -> None:
-        merged = self._merge_entries(self.chat_log, entries)
-        if merged == self.chat_log:
+    def _merge_server_messages(self, payload: dict[str, object]) -> None:
+        persona = payload.get("persona")
+        if isinstance(persona, str):
+            self.persona = persona
+        raw_messages = payload.get("messages")
+        if not isinstance(raw_messages, list):
             return
-        self.chat_log = merged[-HISTORY_KEEP:]
-        self._save_local_history()
-        self._render_history()
+        entries: list[dict[str, str]] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "")
+            if role not in {"user", "assistant"} or not content:
+                continue
+            entries.append(self._normalize_entry({
+                "message_id": item.get("message_id") or item.get("message_uid"),
+                "conversation_id": item.get("conversation_id") or CONVERSATION_ID,
+                "role": role,
+                "author": self._author_for_role(role, str(payload.get("persona") or self.persona)),
+                "text": content,
+                "created_at": item.get("created_at") or utc_now(),
+                "client_created_at": item.get("client_created_at") or item.get("created_at") or utc_now(),
+                "device_id": item.get("device_id") or "server",
+            }) or {})
+        before = json.dumps(self.chat_log, ensure_ascii=False, sort_keys=True)
+        self.chat_log = self._merge_entries(self.chat_log, entries)[-HISTORY_KEEP:]
+        after = json.dumps(self.chat_log, ensure_ascii=False, sort_keys=True)
+        if after != before:
+            self._save_local_history()
+            self._render_history()
 
     def _merge_entries(self, local: list[dict[str, str]], remote: list[dict[str, str]]) -> list[dict[str, str]]:
         merged: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
+        seen_ids: set[str] = set()
+        seen_hashes: set[tuple[str, str, str]] = set()
         for source in (local, remote):
             for entry in source:
-                author = str(entry.get("author") or "Система")
-                content = str(entry.get("text") or "")
-                if not content or author == "Система":
+                normalized = self._normalize_entry(entry)
+                if not normalized or normalized["role"] == "system":
                     continue
-                key = (author, content)
-                if key in seen:
+                key_id = normalized["message_id"]
+                key_hash = (normalized["conversation_id"], normalized["role"], hashlib.sha256(normalized["text"].encode("utf-8")).hexdigest())
+                if key_id in seen_ids or key_hash in seen_hashes:
                     continue
-                seen.add(key)
-                merged.append({"author": author, "text": content})
+                seen_ids.add(key_id)
+                seen_hashes.add(key_hash)
+                merged.append(normalized)
+        merged.sort(key=lambda item: (item.get("created_at", ""), item.get("message_id", "")))
         return merged
 
     def _render_history(self) -> None:
@@ -360,14 +377,25 @@ class ChatApp(tk.Tk):
         self.history.delete("1.0", tk.END)
         self.history.configure(state=tk.DISABLED)
         for entry in self.chat_log:
-            self._append(entry.get("author", "Система"), entry.get("text", ""), persist=False)
+            self._draw_entry(entry)
         self._scroll_to_bottom()
 
-    def _append(self, author: str, text: str, persist: bool = True) -> None:
-        if persist:
-            self.chat_log.append({"author": author, "text": text})
-            self._save_local_history()
+    def _append_system(self, text: str) -> None:
+        self.history.configure(state=tk.NORMAL)
+        self.history.insert(tk.END, f"Система:\n{text}\n\n", ("system",))
+        self.history.configure(state=tk.DISABLED)
+        self._scroll_to_bottom()
 
+    def _append_entry(self, entry: dict[str, str]) -> None:
+        self.chat_log.append(entry)
+        self.chat_log = self._merge_entries([], self.chat_log)[-HISTORY_KEEP:]
+        self._save_local_history()
+        self._draw_entry(entry)
+        self._scroll_to_bottom()
+
+    def _draw_entry(self, entry: dict[str, str]) -> None:
+        author = entry.get("author", "Система")
+        text = entry.get("text", "")
         self.history.configure(state=tk.NORMAL)
         author_tag = self._author_tag(author)
         self.history.insert(tk.END, f"{author}:\n", ("author", author_tag))
@@ -376,7 +404,6 @@ class ChatApp(tk.Tk):
         else:
             self.history.insert(tk.END, f"{text}\n\n", (author_tag,))
         self.history.configure(state=tk.DISABLED)
-        self._scroll_to_bottom()
 
     def _insert_assistant_text(self, author: str, text: str) -> None:
         block_tag = "block_alien" if author == "ALIEN" else "block_ana"
@@ -389,11 +416,40 @@ class ChatApp(tk.Tk):
                 if rest:
                     self.history.insert(tk.END, f"  {strip_inline_markdown(rest)}\n", (block_tag,))
             else:
-                self.history.insert(tk.END, f"{strip_inline_markdown(raw_line)}\n", (self._author_tag(author),))
+                cleaned = strip_inline_markdown(raw_line)
+                if cleaned:
+                    self.history.insert(tk.END, f"{cleaned}\n", (self._author_tag(author),))
         self.history.insert(tk.END, "\n")
 
+    def _new_entry(self, role: str, author: str, text: str) -> dict[str, str]:
+        created_at = utc_now()
+        return {
+            "message_id": f"{DEVICE_ID}-{uuid.uuid4().hex}",
+            "conversation_id": CONVERSATION_ID,
+            "role": role,
+            "author": author,
+            "text": text,
+            "created_at": created_at,
+            "client_created_at": created_at,
+            "device_id": DEVICE_ID,
+        }
+
+    def _role_for_author(self, author: str) -> str:
+        if author == "Вы":
+            return "user"
+        if author in {"ANA", "ALIEN"}:
+            return "assistant"
+        return "system"
+
+    def _author_for_role(self, role: str, persona: str) -> str:
+        if role == "user":
+            return "Вы"
+        if role == "assistant":
+            return persona if persona in {"ANA", "ALIEN"} else "ANA"
+        return "Система"
+
     def _author_tag(self, author: str) -> str:
-        if author == "Система":
+        if author == "Система" or author == "Ошибка":
             return "system"
         if author == "Вы":
             return "user"

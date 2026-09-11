@@ -185,3 +185,8 @@ storage: PostgreSQL, S3/Yandex Disk backup-слой или отдельный VP
 ```
 
 Копии лежат по умолчанию в `%USERPROFILE%\.ai_assistant\backups`. Если хочешь хранить их в Яндекс.Диске, добавь в локальный `.env` переменную `ASSISTANT_BACKUP_DIR` с путём к синхронизируемой папке.
+
+
+## Sync
+
+Desktop and Android clients now use append-only message sync through /v1/sync; see docs/sync.md.
