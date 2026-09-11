@@ -190,3 +190,7 @@ storage: PostgreSQL, S3/Yandex Disk backup-слой или отдельный VP
 ## Sync
 
 Desktop and Android clients now use append-only message sync through /v1/sync; see docs/sync.md.
+
+## Timed memory
+
+The server exposes current time to the model and supports scheduled timed-memory reminders; see docs/timed_memory.md.

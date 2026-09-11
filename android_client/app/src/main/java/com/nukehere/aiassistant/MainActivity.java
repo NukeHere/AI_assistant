@@ -120,6 +120,10 @@ public class MainActivity extends Activity {
         anaButton.setOnClickListener(v -> sendText("/ana"));
         topButtons.addView(anaButton, weightedButton());
 
+        Button timersButton = new Button(this);
+        timersButton.setText("⏰");
+        timersButton.setOnClickListener(v -> sendText("/timers"));
+        topButtons.addView(timersButton, weightedButton());
         Button alienButton = new Button(this);
         alienButton.setText("ALIEN");
         alienButton.setOnClickListener(v -> sendText("/alien"));
@@ -323,8 +327,8 @@ public class MainActivity extends Activity {
             JSONObject item = messages.optJSONObject(i);
             if (item == null) continue;
             String role = item.optString("role", "");
-            if (!role.equals("user") && !role.equals("assistant")) continue;
-            String author = role.equals("user") ? "Вы" : persona;
+            if (!role.equals("user") && !role.equals("assistant") && !role.equals("system")) continue;
+            String author = role.equals("user") ? "Вы" : (role.equals("assistant") ? persona : "Система");
             JSONObject event = new JSONObject();
             try {
                 event.put("message_id", item.optString("message_id", ""));
@@ -432,7 +436,7 @@ public class MainActivity extends Activity {
 
     private void renderHistory() {
         StringBuilder builder = new StringBuilder();
-        if (events.isEmpty()) builder.append("Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /functions.\n\n");
+        if (events.isEmpty()) builder.append("Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /timers, /functions.\n\n");
         for (JSONObject event : events) {
             String author = event.optString("author", authorForRole(event.optString("role", "system")));
             String text = event.optString("text", "");

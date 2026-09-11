@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 MEMORY_BLOCK_RE = re.compile(r"```assistant_memory\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
@@ -36,6 +37,16 @@ answer, request recall at the end instead of guessing:
 
 If you request recall, give a useful preliminary answer if possible. The server
 may run a second pass with the recalled full memory.
+
+Timed memory is available for future reminders. If the user asks to remember,
+notify, wake up, or bring something back at a specific future date/time, or if
+setting a reminder is clearly useful, append this private block:
+```assistant_memory
+{"timers":[{"summary":"very short reminder cue","full":"complete reminder content","due_at":"2030-04-17T12:34:56Z","timezone":"Europe/Moscow"}]}
+```
+Use absolute ISO-8601 due_at values. If the user gives relative time, calculate
+it from the Current server time shown in the system prompt. Keep summaries very
+short. Never use timers for secrets.
 """.strip()
 
 SECRET_HINTS = (
@@ -56,11 +67,13 @@ SECRET_HINTS = (
 class MemoryDirective:
     remember: list[dict[str, Any]]
     recall: list[str]
+    timers: list[dict[str, Any]]
 
 
 def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
     remember: list[dict[str, Any]] = []
     recall: list[str] = []
+    timers: list[dict[str, Any]] = []
 
     def consume(match: re.Match[str]) -> str:
         nonlocal remember, recall
@@ -77,10 +90,13 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
                 recall.extend(str(item).strip() for item in raw_recall if str(item).strip())
             elif isinstance(raw_recall, str) and raw_recall.strip():
                 recall.append(raw_recall.strip())
+            raw_timers = payload.get("timers", payload.get("schedule", []))
+            if isinstance(raw_timers, list):
+                timers.extend(item for item in raw_timers if isinstance(item, dict))
         return ""
 
     cleaned = MEMORY_BLOCK_RE.sub(consume, text).strip()
-    return cleaned, MemoryDirective(remember=remember, recall=recall)
+    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers)
 
 
 def sanitize_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -157,3 +173,49 @@ def normalize_space(text: str) -> str:
 def has_secret_hint(text: str) -> bool:
     lowered = text.lower()
     return any(hint in lowered for hint in SECRET_HINTS)
+
+
+def sanitize_timed_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for item in items:
+        summary = normalize_space(str(item.get("summary") or ""))[:300]
+        full = normalize_space(str(item.get("full") or item.get("content") or ""))[:3000]
+        due_at = normalize_due_at(str(item.get("due_at") or item.get("time") or item.get("datetime") or ""))
+        timezone_name = normalize_space(str(item.get("timezone") or "Europe/Moscow"))[:80]
+        if not summary and full:
+            summary = full[:180]
+        if not full and summary:
+            full = summary
+        if not summary or not full or not due_at:
+            continue
+        if has_secret_hint(summary) or has_secret_hint(full):
+            continue
+        sanitized.append({"summary": summary, "full": full, "due_at": due_at, "timezone": timezone_name})
+    return sanitized
+
+
+def normalize_due_at(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    if cleaned.endswith("Z"):
+        candidate = cleaned[:-1] + "+00:00"
+    else:
+        candidate = cleaned
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def build_timed_memory_context(due_rows: list[dict[str, Any]], now_utc: str, now_local: str) -> str:
+    parts = [f"Current server time: {now_utc} UTC; Europe/Moscow: {now_local}."]
+    parts.append("You may create timed memory reminders with private assistant_memory timers when useful.")
+    if due_rows:
+        parts.append("Due timed memories for this turn:")
+        for row in due_rows[:8]:
+            parts.append(f"- [{row.get('due_at')}] {row.get('full_content') or row.get('summary')}")
+    return "\n".join(parts)

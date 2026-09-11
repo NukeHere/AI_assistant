@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -19,8 +21,10 @@ from app.message_blocks import parse_render_blocks
 from app.smart_memory import (
     MEMORY_DIRECTIVE_PROMPT,
     build_memory_context,
+    build_timed_memory_context,
     extract_memory_directive,
     sanitize_memory_items,
+    sanitize_timed_memory_items,
 )
 from app.storage import Storage
 
@@ -37,8 +41,26 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "./data/assistant.sqlite3"))
 CLIENT_HISTORY_LIMIT = int(os.getenv("CLIENT_HISTORY_LIMIT", "20"))
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "primary-user")
 DEFAULT_CONVERSATION_ID = os.getenv("DEFAULT_CONVERSATION_ID", "default")
+ASSISTANT_TIMEZONE = os.getenv("ASSISTANT_TIMEZONE", "Europe/Moscow")
 
 storage = Storage(DATABASE_PATH)
+
+def current_times() -> tuple[str, str]:
+    now = datetime.now(timezone.utc)
+    now_utc = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    try:
+        local = now.astimezone(ZoneInfo(ASSISTANT_TIMEZONE))
+    except Exception:
+        if ASSISTANT_TIMEZONE == "Europe/Moscow":
+            local = now.astimezone(timezone(timedelta(hours=3)))
+        else:
+            local = now
+    now_local = local.isoformat(timespec="seconds")
+    return now_utc, now_local
+
+def materialize_due(client_id: str, conversation_id: str) -> list[dict[str, object]]:
+    now_utc, _ = current_times()
+    return storage.materialize_due_timed_memories(client_id, conversation_id, now_utc)
 
 
 def complete(messages: list[dict[str, str]]) -> tuple[str, str]:
@@ -90,7 +112,11 @@ def handle_sync_request(body: dict[str, object]) -> dict[str, object]:
         raise ValueError("conversation_id is required")
     if not isinstance(events, list):
         raise ValueError("messages/events must be an array")
-    return storage.sync_messages(client_id, conversation_id, events, limit=limit)
+    result = storage.sync_messages(client_id, conversation_id, events, limit=limit)
+    materialize_due(client_id, conversation_id)
+    refreshed = storage.sync_messages(client_id, conversation_id, [], limit=limit)
+    refreshed["imported"] = result.get("imported", 0)
+    return refreshed
 
 
 def handle_snapshot_request(body: dict[str, object]) -> dict[str, object]:
@@ -158,6 +184,28 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
             "model_mode": provider_mode(),
         }
 
+    if lower in {"/timers", "/reminders", "таймеры", "напоминания"}:
+        storage.add_message(conversation_id, "user", text)
+        timers = storage.list_timed_memories(client_id, conversation_id, include_triggered=False, limit=20)
+        if not timers:
+            answer = "Активных временных напоминаний нет." if persona == Persona.ANA else "В глубине нет отложенных нот."
+        else:
+            lines = ["Активные временные напоминания:" if persona == Persona.ANA else "Отложенные ноты в глубине:"]
+            for index, timer in enumerate(timers, start=1):
+                lines.append(f"{index}. {timer['due_at']} — {timer['summary']}")
+            answer = "\n".join(lines)
+        storage.add_message(conversation_id, "assistant", answer)
+        return response_payload(
+            conversation_id,
+            persona.value,
+            answer,
+            switched=False,
+            memory_updated=False,
+            memory_saved=0,
+            memory_recalled=0,
+            timed_memory_saved=0,
+            model_mode=provider_mode(),
+        )
     if lower in {"/memory", "/memories", "память"} or lower.startswith("что ты помнишь"):
         storage.add_message(conversation_id, "user", text)
         memories = storage.list_memories(client_id, limit=20)
@@ -188,6 +236,9 @@ def build_messages_for_model(client_id: str, conversation_id: str, text: str, pe
     system_prompt = build_system_prompt(persona, alien_glossary)
     system_prompt += "\n\n" + CAPABILITIES_PROMPT
     system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
+    now_utc, now_local = current_times()
+    due_timers = materialize_due(client_id, conversation_id)
+    system_prompt += "\n\n" + build_timed_memory_context(due_timers, now_utc, now_local)
 
     memory_summaries = storage.memory_summaries_for_prompt(client_id, text)
     memory_context = build_memory_context(memory_summaries)
@@ -215,14 +266,32 @@ def save_memory_items(client_id: str, items: list[dict[str, object]]) -> int:
     return saved
 
 
+
+
+def save_timed_memory_items(client_id: str, conversation_id: str, items: list[dict[str, object]]) -> int:
+    saved = 0
+    for item in sanitize_timed_memory_items(items):
+        storage.add_timed_memory(
+            client_id=client_id,
+            conversation_id=conversation_id,
+            summary=item["summary"],
+            full_content=item["full"],
+            due_at=item["due_at"],
+            timezone_name=item["timezone"],
+            source="model",
+        )
+        saved += 1
+    return saved
+
 def complete_with_smart_memory(
     client_id: str,
     conversation_id: str,
     messages: list[dict[str, str]],
-) -> tuple[str, str, int, int]:
+) -> tuple[str, str, int, int, int]:
     raw_answer, model_mode = complete(messages)
     answer, directive = extract_memory_directive(raw_answer)
     saved = save_memory_items(client_id, directive.remember)
+    timed_saved = save_timed_memory_items(client_id, conversation_id, directive.timers)
     recalled = 0
 
     if directive.recall:
@@ -240,8 +309,9 @@ def complete_with_smart_memory(
             raw_answer, model_mode = complete(recall_messages)
             answer, second_directive = extract_memory_directive(raw_answer)
             saved += save_memory_items(client_id, second_directive.remember)
+            timed_saved += save_timed_memory_items(client_id, conversation_id, second_directive.timers)
 
-    return answer, model_mode, saved, recalled
+    return answer, model_mode, saved, recalled, timed_saved
 
 
 def handle_message_request(body: dict[str, object]) -> dict[str, object]:
@@ -284,7 +354,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     storage.add_message(conversation_id, "user", text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
-    answer, model_mode, saved, recalled = complete_with_smart_memory(client_id, conversation_id, messages)
+    answer, model_mode, saved, recalled, timed_saved = complete_with_smart_memory(client_id, conversation_id, messages)
     storage.add_message(conversation_id, "assistant", answer)
 
     return response_payload(
@@ -295,6 +365,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         memory_updated=saved > 0,
         memory_saved=saved,
         memory_recalled=recalled,
+        timed_memory_saved=timed_saved,
         model_mode=model_mode,
     )
 
@@ -402,6 +473,9 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "sync_endpoint": "/v1/sync",
                 "smart_memory": True,
                 "render_blocks": True,
+                "timed_memory": True,
+                "server_time_utc": current_times()[0],
+                "server_timezone": ASSISTANT_TIMEZONE,
             }
         )
 

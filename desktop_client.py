@@ -92,7 +92,7 @@ class ChatApp(tk.Tk):
             self._render_history()
             self._append_system("Локальная история восстановлена. Сверяю с сервером.")
         else:
-            self._append_system("Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /functions.")
+            self._append_system("Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /timers, /functions.")
         self.after(100, self._poll_results)
         self.after(200, self._sync_history_async)
         self.after(500, self._restore_snapshot_async)
@@ -334,7 +334,7 @@ class ChatApp(tk.Tk):
                 continue
             role = str(item.get("role") or "")
             content = str(item.get("content") or "")
-            if role not in {"user", "assistant"} or not content:
+            if role not in {"user", "assistant", "system"} or not content:
                 continue
             entries.append(self._normalize_entry({
                 "message_id": item.get("message_id") or item.get("message_uid"),
@@ -360,7 +360,7 @@ class ChatApp(tk.Tk):
         for source in (local, remote):
             for entry in source:
                 normalized = self._normalize_entry(entry)
-                if not normalized or normalized["role"] == "system":
+                if not normalized:
                     continue
                 key_id = normalized["message_id"]
                 key_hash = (normalized["conversation_id"], normalized["role"], hashlib.sha256(normalized["text"].encode("utf-8")).hexdigest())

@@ -72,6 +72,25 @@ class Storage:
 
                 create index if not exists idx_memory_cells_client_importance
                     on memory_cells (client_id, importance desc, id desc);
+
+                create table if not exists timed_memories (
+                    id integer primary key autoincrement,
+                    timer_uid text unique,
+                    client_id text not null,
+                    conversation_id text not null,
+                    summary text not null,
+                    full_content text not null,
+                    due_at text not null,
+                    timezone text not null default 'Europe/Moscow',
+                    status text not null default 'scheduled',
+                    source text not null default 'model',
+                    created_at text not null default current_timestamp,
+                    triggered_at text,
+                    materialized_message_uid text
+                );
+
+                create index if not exists idx_timed_memories_due
+                    on timed_memories (client_id, conversation_id, status, due_at);
                 """
             )
             self._ensure_column(conn, "memory_cells", "embedding_json", "text not null default '[]'")
@@ -81,6 +100,8 @@ class Storage:
             self._ensure_column(conn, "messages", "content_hash", "text not null default ''")
             conn.execute("create unique index if not exists idx_messages_uid on messages (message_uid) where message_uid is not null")
             conn.execute("create index if not exists idx_messages_conversation_created on messages (conversation_id, created_at, id)")
+            self._ensure_column(conn, "timed_memories", "timer_uid", "text")
+            self._ensure_column(conn, "timed_memories", "materialized_message_uid", "text")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
@@ -357,6 +378,104 @@ class Storage:
             ).fetchall()
         return [f"{row['kind']}: {row['content']}" for row in old_rows]
 
+    def add_timed_memory(
+        self,
+        client_id: str,
+        conversation_id: str,
+        summary: str,
+        full_content: str,
+        due_at: str,
+        timezone_name: str = "Europe/Moscow",
+        source: str = "model",
+    ) -> dict[str, Any]:
+        self.ensure_conversation(client_id, conversation_id)
+        seed = "|".join([client_id, conversation_id, summary, full_content, due_at])
+        timer_uid = "tmr-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                insert into timed_memories
+                    (timer_uid, client_id, conversation_id, summary, full_content, due_at, timezone, source)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(timer_uid) do update set
+                    summary = excluded.summary,
+                    full_content = excluded.full_content,
+                    due_at = excluded.due_at,
+                    timezone = excluded.timezone,
+                    status = 'scheduled',
+                    triggered_at = null,
+                    materialized_message_uid = null
+                """,
+                (timer_uid, client_id, conversation_id, summary, full_content, due_at, timezone_name, source),
+            )
+            row = conn.execute("select * from timed_memories where timer_uid = ?", (timer_uid,)).fetchone()
+        return dict(row)
+
+    def list_timed_memories(
+        self,
+        client_id: str,
+        conversation_id: str | None = None,
+        include_triggered: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        where = ["client_id = ?"]
+        params: list[Any] = [client_id]
+        if conversation_id:
+            where.append("conversation_id = ?")
+            params.append(conversation_id)
+        if not include_triggered:
+            where.append("status = 'scheduled'")
+        params.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                select * from timed_memories
+                 where {' and '.join(where)}
+                 order by due_at asc, id asc
+                 limit ?
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def materialize_due_timed_memories(self, client_id: str, conversation_id: str, now_utc: str) -> list[dict[str, Any]]:
+        self.ensure_conversation(client_id, conversation_id)
+        with self._lock, self._connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select * from timed_memories
+                     where client_id = ? and conversation_id = ? and status = 'scheduled' and due_at <= ?
+                     order by due_at asc, id asc
+                     limit 10
+                    """,
+                    (client_id, conversation_id, now_utc),
+                ).fetchall()
+            ]
+            for row in rows:
+                message_uid = f"timer-{row['timer_uid']}"
+                content = f"⏰ Временная память сработала: {row['summary']}\n{row['full_content']}"
+                content_hash = self.message_hash(conversation_id, "system", content)
+                conn.execute(
+                    """
+                    insert or ignore into messages (conversation_id, role, content, message_uid, device_id, client_created_at, content_hash)
+                    values (?, 'system', ?, ?, 'timer', ?, ?)
+                    """,
+                    (conversation_id, content, message_uid, row["due_at"], content_hash),
+                )
+                conn.execute(
+                    """
+                    update timed_memories
+                       set status = 'triggered', triggered_at = ?, materialized_message_uid = ?
+                     where id = ?
+                    """,
+                    (now_utc, message_uid, row["id"]),
+                )
+            if rows:
+                conn.execute("update conversations set updated_at = current_timestamp where id = ?", (conversation_id,))
+        return rows
+
     def export_client_snapshot(self, client_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
             conversations = [
@@ -412,6 +531,19 @@ class Storage:
                     (client_id,),
                 ).fetchall()
             ]
+            timed_memories = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select timer_uid, client_id, conversation_id, summary, full_content, due_at,
+                           timezone, status, source, created_at, triggered_at, materialized_message_uid
+                      from timed_memories
+                     where client_id = ?
+                     order by due_at, id
+                    """,
+                    (client_id,),
+                ).fetchall()
+            ]
         return {
             "format": "ai-assistant-snapshot-v1",
             "client_id": client_id,
@@ -419,6 +551,7 @@ class Storage:
             "messages": messages,
             "memories": memories,
             "memory_cells": memory_cells,
+            "timed_memories": timed_memories,
         }
 
     def import_client_snapshot(self, client_id: str, snapshot: dict[str, Any]) -> dict[str, int]:
@@ -431,10 +564,11 @@ class Storage:
         messages = snapshot.get("messages") or []
         memories = snapshot.get("memories") or []
         memory_cells = snapshot.get("memory_cells") or []
-        if not all(isinstance(items, list) for items in [conversations, messages, memories, memory_cells]):
+        timed_memories = snapshot.get("timed_memories") or []
+        if not all(isinstance(items, list) for items in [conversations, messages, memories, memory_cells, timed_memories]):
             raise ValueError("Snapshot sections must be arrays")
 
-        counts = {"conversations": 0, "messages": 0, "memories": 0, "memory_cells": 0}
+        counts = {"conversations": 0, "messages": 0, "memories": 0, "memory_cells": 0, "timed_memories": 0}
         with self._lock, self._connect() as conn:
             for item in conversations:
                 if not isinstance(item, dict) or not item.get("id"):
@@ -584,6 +718,49 @@ class Storage:
                         """,
                         (kind, full_content, topics_json, embedding_json, importance, existing["id"]),
                     )
+
+            for item in timed_memories:
+                if not isinstance(item, dict):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                full_content = str(item.get("full_content") or "").strip()
+                due_at = str(item.get("due_at") or "").strip()
+                conversation_id = str(item.get("conversation_id") or "default").strip()
+                if not summary or not full_content or not due_at or not conversation_id:
+                    continue
+                seed = "|".join([client_id, conversation_id, summary, full_content, due_at])
+                timer_uid = str(item.get("timer_uid") or "").strip() or "tmr-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+                conn.execute(
+                    """
+                    insert into timed_memories
+                        (timer_uid, client_id, conversation_id, summary, full_content, due_at,
+                         timezone, status, source, created_at, triggered_at, materialized_message_uid)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, current_timestamp), ?, ?)
+                    on conflict(timer_uid) do update set
+                        summary = excluded.summary,
+                        full_content = excluded.full_content,
+                        due_at = excluded.due_at,
+                        timezone = excluded.timezone,
+                        status = excluded.status,
+                        triggered_at = excluded.triggered_at,
+                        materialized_message_uid = excluded.materialized_message_uid
+                    """,
+                    (
+                        timer_uid,
+                        client_id,
+                        conversation_id,
+                        summary,
+                        full_content,
+                        due_at,
+                        str(item.get("timezone") or "Europe/Moscow"),
+                        str(item.get("status") or "scheduled"),
+                        str(item.get("source") or "snapshot"),
+                        item.get("created_at"),
+                        item.get("triggered_at"),
+                        item.get("materialized_message_uid"),
+                    ),
+                )
+                counts["timed_memories"] += 1
         return counts
 
     def sync_messages(
