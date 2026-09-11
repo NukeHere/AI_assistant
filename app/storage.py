@@ -137,6 +137,20 @@ class Storage:
                 (client_id, kind, content, importance),
             )
 
+
+    def list_memories(self, client_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                select id, kind, content, importance, created_at
+                  from memories
+                 where client_id = ?
+                 order by importance desc, id desc
+                 limit ?
+                """,
+                (client_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
     def memories_for_prompt(self, client_id: str, limit: int = 10) -> list[str]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(

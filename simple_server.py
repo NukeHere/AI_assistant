@@ -27,7 +27,7 @@ MODEL_API_KEY = os.getenv("MODEL_API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "./data/assistant.sqlite3"))
 CLIENT_HISTORY_LIMIT = int(os.getenv("CLIENT_HISTORY_LIMIT", "20"))
-DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "desktop")
+DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "primary-user")
 DEFAULT_CONVERSATION_ID = os.getenv("DEFAULT_CONVERSATION_ID", "default")
 
 storage = Storage(DATABASE_PATH)
@@ -41,6 +41,72 @@ def complete(messages: list[dict[str, str]]) -> tuple[str, str]:
     if MODEL_PROVIDER != "mock":
         raise RuntimeError(f"Unknown MODEL_PROVIDER: {MODEL_PROVIDER}")
     return mock_response(messages), "mock"
+
+
+def handle_history_request(body: dict[str, object]) -> dict[str, object]:
+    client_id = str(body.get("client_id") or DEFAULT_CLIENT_ID).strip()
+    conversation_id = str(body.get("conversation_id") or DEFAULT_CONVERSATION_ID).strip()
+    limit = int(body.get("limit") or CLIENT_HISTORY_LIMIT)
+    conversation = storage.ensure_conversation(client_id, conversation_id)
+    return {
+        "conversation_id": conversation_id,
+        "persona": conversation["persona"],
+        "messages": storage.recent_messages(conversation_id, limit),
+    }
+
+
+def handle_memory_command(client_id: str, conversation_id: str, text: str, persona: Persona) -> dict[str, object] | None:
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    content = ""
+    if lower.startswith("/remember"):
+        content = stripped[len("/remember") :].strip(" :-")
+    elif lower.startswith("запомни:"):
+        content = stripped.split(":", 1)[1].strip()
+    elif lower.startswith("запомни, что"):
+        content = stripped[len("запомни, что") :].strip(" .")
+    elif lower.startswith("запомни что"):
+        content = stripped[len("запомни что") :].strip(" .")
+
+    if content:
+        storage.remember(client_id, "user_note", content, importance=3)
+        storage.add_message(conversation_id, "user", text)
+        if persona == Persona.ALIEN:
+            answer = "Нота помещена в глубину памяти. Она будет звучать в следующих песнях."
+        else:
+            answer = "Запись добавлена в память. Буду учитывать это в следующих ответах."
+        storage.add_message(conversation_id, "assistant", answer)
+        return {
+            "conversation_id": conversation_id,
+            "persona": persona.value,
+            "switched": False,
+            "memory_updated": True,
+            "text": answer,
+            "model_mode": provider_mode(),
+        }
+
+    if lower in {"/memory", "/memories", "память"} or lower.startswith("что ты помнишь"):
+        storage.add_message(conversation_id, "user", text)
+        memories = storage.list_memories(client_id, limit=20)
+        if not memories:
+            answer = "В памяти пока нет записей." if persona == Persona.ANA else "Глубина пока пуста. Ноты ещё не осели."
+        else:
+            lines = ["Память:" if persona == Persona.ANA else "Ноты в глубине:"]
+            for index, memory in enumerate(memories, start=1):
+                lines.append(f"{index}. {memory['content']}")
+            answer = "\n".join(lines)
+        storage.add_message(conversation_id, "assistant", answer)
+        return {
+            "conversation_id": conversation_id,
+            "persona": persona.value,
+            "switched": False,
+            "memory_updated": False,
+            "text": answer,
+            "model_mode": provider_mode(),
+        }
+
+    return None
 
 
 def handle_message_request(body: dict[str, object]) -> dict[str, object]:
@@ -71,6 +137,10 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
             "text": answer,
             "model_mode": provider_mode(),
         }
+
+    memory_response = handle_memory_command(client_id, conversation_id, text, active_persona)
+    if memory_response is not None:
+        return memory_response
 
     memories = storage.memories_for_prompt(client_id)
     alien_glossary = storage.alien_glossary(conversation_id)
@@ -165,8 +235,8 @@ def mock_response(messages: list[dict[str, str]]) -> str:
             last_user_text = message.get("content", "")
             break
     if "Active persona: ALIEN" in system:
-        return f"Окно приняло ноту. Тестовый ответ без внешней модели: {last_user_text[:220]}"
-    return f"Запрос принят. Тестовый ответ без внешней модели: {last_user_text[:220]}"
+        return f"**Observation:** Окно приняло ноту.\n**Explanation:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
+    return f"**Observation:** Запрос принят.\n**Recommended action:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
 
 
 def valid_messages(value: object) -> bool:
@@ -183,7 +253,7 @@ def valid_messages(value: object) -> bool:
 
 
 class AssistantHandler(BaseHTTPRequestHandler):
-    server_version = "AIAssistantSimple/0.2"
+    server_version = "AIAssistantSimple/0.3"
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -195,11 +265,12 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "server": "simple",
                 "model_mode": provider_mode(),
                 "message_endpoint": "/v1/message",
+                "history_endpoint": "/v1/history",
             }
         )
 
     def do_POST(self) -> None:
-        if self.path not in {"/v1/chat/simple", "/v1/message"}:
+        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history"}:
             self.send_json({"error": "Not found"}, status=404)
             return
         if not self.authorized():
@@ -213,6 +284,9 @@ class AssistantHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            if self.path == "/v1/history":
+                self.send_json(handle_history_request(body))
+                return
             if self.path == "/v1/message":
                 self.send_json(handle_message_request(body))
                 return
@@ -263,7 +337,7 @@ def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
-    print("Endpoints: POST /v1/message, POST /v1/chat/simple", flush=True)
+    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 
