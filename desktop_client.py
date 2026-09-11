@@ -46,6 +46,7 @@ CONVERSATION_ID = os.getenv("ASSISTANT_CONVERSATION_ID", "default")
 LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_assistant"))
 HISTORY_PATH = LOCAL_DATA_DIR / f"history-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
 SNAPSHOT_PATH = LOCAL_DATA_DIR / f"snapshot-{safe_name(CLIENT_ID)}.json"
+NOTIFIED_TIMERS_PATH = LOCAL_DATA_DIR / f"notified-timers-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
 HISTORY_KEEP = int(os.getenv("ASSISTANT_LOCAL_HISTORY_KEEP", "400"))
 SYNC_INTERVAL_MS = max(5, int(os.getenv("ASSISTANT_SYNC_INTERVAL_SECONDS", "10"))) * 1000
 
@@ -60,6 +61,7 @@ class ChatApp(tk.Tk):
         self.results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.persona = "ANA"
         self.chat_log = self._load_local_history()
+        self.notified_timer_ids = self._load_notified_timer_ids()
         self._sync_running = False
 
         quick = tk.Frame(self)
@@ -155,6 +157,56 @@ class ChatApp(tk.Tk):
     def _save_local_history(self) -> None:
         LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_PATH.write_text(json.dumps(self.chat_log[-HISTORY_KEEP:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_notified_timer_ids(self) -> set[str]:
+        try:
+            raw = json.loads(NOTIFIED_TIMERS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return set()
+        if not isinstance(raw, list):
+            return set()
+        return {str(item) for item in raw if isinstance(item, str) and item}
+
+    def _save_notified_timer_ids(self) -> None:
+        LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        recent_ids = sorted(self.notified_timer_ids)[-500:]
+        NOTIFIED_TIMERS_PATH.write_text(json.dumps(recent_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _is_timed_memory_entry(self, entry: dict[str, str]) -> bool:
+        if entry.get("role") != "system":
+            return False
+        text = entry.get("text", "")
+        return "⏰" in text or "Временная память сработала" in text
+
+    def _maybe_notify_timer(self, entry: dict[str, str]) -> None:
+        if not self._is_timed_memory_entry(entry):
+            return
+        message_id = entry.get("message_id", "")
+        if not message_id or message_id in self.notified_timer_ids:
+            return
+        self.notified_timer_ids.add(message_id)
+        self._save_notified_timer_ids()
+        self.after_idle(lambda text=entry.get("text", ""): self._show_timer_notification(text))
+
+    def _show_timer_notification(self, text: str) -> None:
+        title = "AI Assistant — напоминание"
+        body = strip_inline_markdown(text).strip() or "Сработала временная память."
+        try:
+            self.bell()
+        except tk.TclError:
+            pass
+        try:
+            popup = tk.Toplevel(self)
+            popup.title(title)
+            popup.attributes("-topmost", True)
+            popup.resizable(False, False)
+            popup.geometry("420x170+80+80")
+            tk.Label(popup, text=title, font=("TkDefaultFont", 11, "bold"), anchor="w").pack(fill=tk.X, padx=14, pady=(12, 4))
+            tk.Label(popup, text=body, justify=tk.LEFT, wraplength=380, anchor="w").pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
+            tk.Button(popup, text="ОК", command=popup.destroy).pack(pady=(0, 12))
+            popup.after(15000, lambda: popup.winfo_exists() and popup.destroy())
+        except tk.TclError:
+            messagebox.showinfo(title, body)
 
     def _endpoint_url(self, endpoint: str) -> str | None:
         stripped = API_URL.rstrip("/")
@@ -351,6 +403,10 @@ class ChatApp(tk.Tk):
                 "client_created_at": item.get("client_created_at") or item.get("created_at") or utc_now(),
                 "device_id": item.get("device_id") or "server",
             }) or {})
+        known_ids = {entry.get("message_id", "") for entry in self.chat_log}
+        for entry in entries:
+            if entry and entry.get("message_id", "") not in known_ids:
+                self._maybe_notify_timer(entry)
         before = json.dumps(self.chat_log, ensure_ascii=False, sort_keys=True)
         self.chat_log = self._merge_entries(self.chat_log, entries)[-HISTORY_KEEP:]
         after = json.dumps(self.chat_log, ensure_ascii=False, sort_keys=True)

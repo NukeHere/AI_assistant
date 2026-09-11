@@ -1,8 +1,17 @@
 package com.nukehere.aiassistant;
 
+import android.Manifest;
+
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -49,6 +58,8 @@ public class MainActivity extends Activity {
     private static final String DEVICE_ID = "android-" + android.os.Build.MODEL.replaceAll("[^a-zA-Z0-9_.-]+", "_");
     private static final int HISTORY_KEEP = 400;
     private static final long AUTO_SYNC_MS = 10000L;
+    private static final String TIMER_CHANNEL_ID = "timed_memory";
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 4301;
     private static final Pattern STRUCTURED_LINE = Pattern.compile(
             "^\\s*(?:[-*]\\s*)?(?:\\*\\*)?(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)(?:\\*\\*)?\\s*:\\s*(.*)$",
             Pattern.CASE_INSENSITIVE
@@ -65,12 +76,15 @@ public class MainActivity extends Activity {
     private Button sendButton;
     private String persona = "ANA";
     private final List<JSONObject> events = new ArrayList<>();
+    private final HashSet<String> notifiedTimerIds = new HashSet<>();
     private boolean syncRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        setupNotifications();
+        notifiedTimerIds.addAll(prefs.getStringSet("notified_timer_ids", new HashSet<>()));
         events.addAll(loadEvents());
         buildUi();
         renderHistory();
@@ -84,6 +98,77 @@ public class MainActivity extends Activity {
             scheduleAutoSync();
         }, AUTO_SYNC_MS);
     }
+    private void setupNotifications() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) {
+                NotificationChannel channel = new NotificationChannel(
+                        TIMER_CHANNEL_ID,
+                        "AI Assistant reminders",
+                        NotificationManager.IMPORTANCE_DEFAULT
+                );
+                channel.setDescription("Timed memory reminders from AI Assistant");
+                manager.createNotificationChannel(channel);
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION_REQUEST);
+        }
+    }
+
+    private boolean isTimedMemoryEvent(JSONObject event) {
+        if (!"system".equals(event.optString("role", ""))) return false;
+        String text = event.optString("text", "");
+        return text.contains("⏰") || text.contains("Временная память сработала");
+    }
+
+    private void maybeNotifyTimer(JSONObject event) {
+        if (!isTimedMemoryEvent(event)) return;
+        String messageId = event.optString("message_id", "");
+        if (messageId.isEmpty() || notifiedTimerIds.contains(messageId)) return;
+        notifiedTimerIds.add(messageId);
+        saveNotifiedTimerIds();
+        showTimerNotification(messageId, event.optString("text", "Сработала временная память."));
+    }
+
+    private void saveNotifiedTimerIds() {
+        prefs.edit().putStringSet("notified_timer_ids", new HashSet<>(notifiedTimerIds)).apply();
+    }
+
+    private void showTimerNotification(String messageId, String text) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Напоминание: " + shortNotificationText(text), Toast.LENGTH_LONG).show();
+            return;
+        }
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager == null) return;
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags |= PendingIntent.FLAG_IMMUTABLE;
+        PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, intent, flags);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, TIMER_CHANNEL_ID)
+                : new Notification.Builder(this);
+        builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("AI Assistant — напоминание")
+                .setContentText(shortNotificationText(text))
+                .setStyle(new Notification.BigTextStyle().bigText(text))
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setWhen(System.currentTimeMillis())
+                .setShowWhen(true);
+        manager.notify(messageId.hashCode(), builder.build());
+    }
+
+    private String shortNotificationText(String text) {
+        String clean = text.replace("⏰", "").replace("**", "").trim();
+        if (clean.length() <= 90) return clean;
+        return clean.substring(0, 87) + "...";
+    }
+
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -348,7 +433,9 @@ public class MainActivity extends Activity {
                 event.put("created_at", item.optString("created_at", nowUtc()));
                 event.put("client_created_at", item.optString("client_created_at", item.optString("created_at", nowUtc())));
                 event.put("device_id", item.optString("device_id", "server"));
-                remote.add(normalizeEvent(event));
+                JSONObject normalized = normalizeEvent(event);
+                remote.add(normalized);
+                maybeNotifyTimer(normalized);
             } catch (Exception ignored) {}
         }
         List<JSONObject> merged = mergeEvents(events, remote);
