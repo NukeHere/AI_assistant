@@ -4,6 +4,7 @@ from pathlib import Path
 
 import simple_server
 from app.personas import Persona, build_system_prompt, detect_persona_switch, extract_alien_glossary_terms
+from app.smart_memory import extract_memory_directive
 from app.storage import Storage
 from simple_server import (
     handle_history_request,
@@ -47,14 +48,14 @@ class SimpleServerTests(unittest.TestCase):
         with isolated_storage():
             switched = handle_message_request(
                 {
-                    "client_id": "desktop",
+                    "client_id": "primary-user",
                     "conversation_id": "behaviour-test",
                     "text": "переключись на инопланетный режим",
                 }
             )
             answer = handle_message_request(
                 {
-                    "client_id": "desktop",
+                    "client_id": "primary-user",
                     "conversation_id": "behaviour-test",
                     "text": "Объясни Docker простыми словами",
                 }
@@ -69,14 +70,14 @@ class SimpleServerTests(unittest.TestCase):
         with isolated_storage():
             stored = handle_message_request(
                 {
-                    "client_id": "desktop",
+                    "client_id": "primary-user",
                     "conversation_id": "memory-test",
                     "text": "запомни: мой основной проект называется AI Assistant",
                 }
             )
             listed = handle_message_request(
                 {
-                    "client_id": "desktop",
+                    "client_id": "primary-user",
                     "conversation_id": "memory-test",
                     "text": "/memory",
                 }
@@ -85,17 +86,92 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(stored["memory_updated"])
         self.assertIn("AI Assistant", listed["text"])
 
+    def test_model_memory_directive_is_saved_and_hidden(self) -> None:
+        old_complete = simple_server.complete
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Запомнил рабочий факт.\n"
+                "```assistant_memory\n"
+                '{"remember":[{"kind":"important","summary":"пользователь работает над AI Assistant",'
+                '"full":"Пользователь работает над проектом AI Assistant как личным агентом.",'
+                '"topics":["ai assistant","project"],"importance":5}]}\n'
+                "```",
+                "mock",
+            )
+
+        with isolated_storage():
+            simple_server.complete = fake_complete
+            try:
+                response = handle_message_request(
+                    {
+                        "client_id": "primary-user",
+                        "conversation_id": "smart-save-test",
+                        "text": "Я делаю AI Assistant",
+                    }
+                )
+                memories = simple_server.storage.list_memories("primary-user")
+            finally:
+                simple_server.complete = old_complete
+
+        self.assertEqual(response["memory_saved"], 1)
+        self.assertNotIn("assistant_memory", response["text"])
+        self.assertIn("AI Assistant", memories[0]["summary"])
+
+    def test_model_can_recall_full_memory_for_second_pass(self) -> None:
+        old_complete = simple_server.complete
+        calls: list[list[dict[str, str]]] = []
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            calls.append(messages)
+            if len(calls) == 1:
+                return (
+                    "Уточняю память.\n"
+                    "```assistant_memory\n"
+                    '{"recall":["любимый проект"]}\n'
+                    "```",
+                    "mock",
+                )
+            joined = "\n".join(message["content"] for message in messages)
+            assert "Recalled full memory cells" in joined
+            return "Полная память использована.", "mock"
+
+        with isolated_storage():
+            simple_server.storage.add_memory_cell(
+                client_id="primary-user",
+                kind="important",
+                summary="любимый проект пользователя",
+                full_content="Любимый тестовый проект пользователя называется AI Assistant.",
+                topics=["любимый проект", "ai assistant"],
+                importance=5,
+            )
+            simple_server.complete = fake_complete
+            try:
+                response = handle_message_request(
+                    {
+                        "client_id": "primary-user",
+                        "conversation_id": "smart-recall-test",
+                        "text": "Как называется мой любимый проект?",
+                    }
+                )
+            finally:
+                simple_server.complete = old_complete
+
+        self.assertEqual(response["memory_recalled"], 1)
+        self.assertEqual(response["text"], "Полная память использована.")
+        self.assertEqual(len(calls), 2)
+
     def test_history_endpoint_returns_recent_messages(self) -> None:
         with isolated_storage():
             handle_message_request(
                 {
-                    "client_id": "desktop",
+                    "client_id": "primary-user",
                     "conversation_id": "history-test",
                     "text": "Привет",
                 }
             )
             history = handle_history_request(
-                {"client_id": "desktop", "conversation_id": "history-test", "limit": 10}
+                {"client_id": "primary-user", "conversation_id": "history-test", "limit": 10}
             )
 
         self.assertEqual(history["persona"], "ANA")
@@ -108,6 +184,14 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(terms["api"], "окно")
         self.assertEqual(terms["сервер"], "храм")
         self.assertEqual(terms["ошибка"], "диссонанс")
+
+    def test_memory_directive_parser_removes_private_block(self) -> None:
+        cleaned, directive = extract_memory_directive(
+            'Ответ.\n```assistant_memory\n{"recall":["проект"]}\n```'
+        )
+
+        self.assertEqual(cleaned, "Ответ.")
+        self.assertEqual(directive.recall, ["проект"])
 
     def test_persona_prompts_support_structured_user_facing_cues(self) -> None:
         ana = build_system_prompt(Persona.ANA)

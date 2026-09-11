@@ -14,6 +14,12 @@ from app.personas import (
     detect_persona_switch,
     extract_alien_glossary_terms,
 )
+from app.smart_memory import (
+    MEMORY_DIRECTIVE_PROMPT,
+    build_memory_context,
+    extract_memory_directive,
+    sanitize_memory_items,
+)
 from app.storage import Storage
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
@@ -70,7 +76,7 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
         content = stripped[len("запомни что") :].strip(" .")
 
     if content:
-        storage.remember(client_id, "user_note", content, importance=3)
+        storage.remember(client_id, "manual", content, importance=4)
         storage.add_message(conversation_id, "user", text)
         if persona == Persona.ALIEN:
             answer = "Нота помещена в глубину памяти. Она будет звучать в следующих песнях."
@@ -82,6 +88,8 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
             "persona": persona.value,
             "switched": False,
             "memory_updated": True,
+            "memory_saved": 1,
+            "memory_recalled": 0,
             "text": answer,
             "model_mode": provider_mode(),
         }
@@ -94,7 +102,7 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
         else:
             lines = ["Память:" if persona == Persona.ANA else "Ноты в глубине:"]
             for index, memory in enumerate(memories, start=1):
-                lines.append(f"{index}. {memory['content']}")
+                lines.append(f"{index}. {memory['summary']}")
             answer = "\n".join(lines)
         storage.add_message(conversation_id, "assistant", answer)
         return {
@@ -102,11 +110,73 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
             "persona": persona.value,
             "switched": False,
             "memory_updated": False,
+            "memory_saved": 0,
+            "memory_recalled": 0,
             "text": answer,
             "model_mode": provider_mode(),
         }
 
     return None
+
+
+def build_messages_for_model(client_id: str, conversation_id: str, text: str, persona: Persona) -> list[dict[str, str]]:
+    alien_glossary = storage.alien_glossary(conversation_id)
+    system_prompt = build_system_prompt(persona, alien_glossary)
+    system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
+
+    memory_summaries = storage.memory_summaries_for_prompt(client_id, text)
+    memory_context = build_memory_context(memory_summaries)
+    if memory_context:
+        system_prompt += "\n\n" + memory_context
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(storage.recent_messages(conversation_id, CLIENT_HISTORY_LIMIT))
+    messages.append({"role": "user", "content": text})
+    return messages
+
+
+def save_memory_items(client_id: str, items: list[dict[str, object]]) -> int:
+    saved = 0
+    for item in sanitize_memory_items(items):
+        storage.add_memory_cell(
+            client_id=client_id,
+            kind=item["kind"],
+            summary=item["summary"],
+            full_content=item["full"],
+            topics=item["topics"],
+            importance=item["importance"],
+        )
+        saved += 1
+    return saved
+
+
+def complete_with_smart_memory(
+    client_id: str,
+    conversation_id: str,
+    messages: list[dict[str, str]],
+) -> tuple[str, str, int, int]:
+    raw_answer, model_mode = complete(messages)
+    answer, directive = extract_memory_directive(raw_answer)
+    saved = save_memory_items(client_id, directive.remember)
+    recalled = 0
+
+    if directive.recall:
+        full_memories = storage.search_memory_cells(client_id, directive.recall, limit=5)
+        recalled = len(full_memories)
+        if full_memories:
+            recall_context = build_memory_context([], full_memories)
+            recall_messages = messages + [
+                {"role": "assistant", "content": answer or "Memory recall requested."},
+                {
+                    "role": "system",
+                    "content": recall_context + "\n\nAnswer the user's last message using the recalled memory. You may save new memory if needed.",
+                },
+            ]
+            raw_answer, model_mode = complete(recall_messages)
+            answer, second_directive = extract_memory_directive(raw_answer)
+            saved += save_memory_items(client_id, second_directive.remember)
+
+    return answer, model_mode, saved, recalled
 
 
 def handle_message_request(body: dict[str, object]) -> dict[str, object]:
@@ -134,6 +204,8 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
             "conversation_id": conversation_id,
             "persona": switched_persona.value,
             "switched": True,
+            "memory_saved": 0,
+            "memory_recalled": 0,
             "text": answer,
             "model_mode": provider_mode(),
         }
@@ -142,26 +214,21 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     if memory_response is not None:
         return memory_response
 
-    memories = storage.memories_for_prompt(client_id)
-    alien_glossary = storage.alien_glossary(conversation_id)
-    system_prompt = build_system_prompt(active_persona, alien_glossary)
-    if memories:
-        system_prompt += "\n\nRelevant long-term memory:\n" + "\n".join(f"- {item}" for item in memories)
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(storage.recent_messages(conversation_id, CLIENT_HISTORY_LIMIT))
-    messages.append({"role": "user", "content": text})
+    messages = build_messages_for_model(client_id, conversation_id, text, active_persona)
 
     storage.add_message(conversation_id, "user", text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
-    answer, model_mode = complete(messages)
+    answer, model_mode, saved, recalled = complete_with_smart_memory(client_id, conversation_id, messages)
     storage.add_message(conversation_id, "assistant", answer)
 
     return {
         "conversation_id": conversation_id,
         "persona": active_persona.value,
         "switched": False,
+        "memory_updated": saved > 0,
+        "memory_saved": saved,
+        "memory_recalled": recalled,
         "text": answer,
         "model_mode": model_mode,
     }
@@ -253,7 +320,7 @@ def valid_messages(value: object) -> bool:
 
 
 class AssistantHandler(BaseHTTPRequestHandler):
-    server_version = "AIAssistantSimple/0.3"
+    server_version = "AIAssistantSimple/0.4"
 
     def do_GET(self) -> None:
         if self.path != "/health":
@@ -266,6 +333,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "model_mode": provider_mode(),
                 "message_endpoint": "/v1/message",
                 "history_endpoint": "/v1/history",
+                "smart_memory": True,
             }
         )
 

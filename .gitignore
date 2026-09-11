@@ -5,3 +5,4 @@ __pycache__/
 data/
 backups/
 *.log
+.local-build/
