@@ -170,10 +170,10 @@ storage: PostgreSQL, S3/Yandex Disk backup-слой или отдельный VP
 .\.venv\Scripts\python.exe backup_agent.py once
 ```
 
-Постоянный режим: backup каждые 12 часов, хранить последние 10 копий:
+Тестовый постоянный режим: backup каждые 10 секунд, хранить последние 10 копий:
 
 ```powershell
-.\.venv\Scripts\python.exe backup_agent.py loop --interval 43200
+.\.venv\Scripts\python.exe backup_agent.py loop
 ```
 
 Восстановить Render из последней локальной копии:

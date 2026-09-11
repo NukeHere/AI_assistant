@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 DEFAULT_API_URL = "https://ai-assistant-4yn0.onrender.com/v1/message"
 DEFAULT_CLIENT_ID = "primary-user"
 DEFAULT_KEEP = 10
-DEFAULT_INTERVAL_SECONDS = 12 * 60 * 60
+DEFAULT_INTERVAL_SECONDS = 10
 
 
 def load_local_env() -> None:
@@ -76,7 +76,7 @@ def save_backup(backup_dir: Path, client_id: str, snapshot: dict[str, object]) -
 
 def list_backups(backup_dir: Path, client_id: str) -> list[Path]:
     pattern = f"assistant-snapshot-{safe_name(client_id)}-*.json"
-    return sorted(backup_dir.glob(pattern), key=lambda path: path.stat().st_mtime, reverse=True)
+    return sorted(backup_dir.glob(pattern), key=lambda path: path.name, reverse=True)
 
 
 def prune_backups(backup_dir: Path, client_id: str, keep: int) -> list[Path]:
