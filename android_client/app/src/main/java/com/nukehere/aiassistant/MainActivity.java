@@ -47,6 +47,7 @@ public class MainActivity extends Activity {
 
     private EditText apiUrlInput;
     private EditText tokenInput;
+    private ScrollView scrollView;
     private TextView historyView;
     private EditText messageInput;
     private Button sendButton;
@@ -58,6 +59,7 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         setContentView(buildLayout());
         historyView.setText(prefs.getString("history", "Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /functions.\n\n"));
+        scrollToBottom();
         syncHistory();
     }
 
@@ -96,6 +98,11 @@ public class MainActivity extends Activity {
         syncButton.setOnClickListener(v -> syncHistory());
         topButtons.addView(syncButton, weightedButton());
 
+        Button downButton = new Button(this);
+        downButton.setText("↓");
+        downButton.setOnClickListener(v -> scrollToBottom());
+        topButtons.addView(downButton, weightedButton());
+
         Button anaButton = new Button(this);
         anaButton.setText("ANA");
         anaButton.setOnClickListener(v -> sendText("/ana"));
@@ -112,9 +119,9 @@ public class MainActivity extends Activity {
         historyView.setTextIsSelectable(true);
         historyView.setPadding(8, 8, 8, 8);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(historyView);
-        root.addView(scroll, new LinearLayout.LayoutParams(
+        scrollView = new ScrollView(this);
+        scrollView.addView(historyView);
+        root.addView(scrollView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1f
@@ -180,28 +187,41 @@ public class MainActivity extends Activity {
             if (messages == null || messages.length() == 0) {
                 return;
             }
-            StringBuilder rendered = new StringBuilder();
-            for (int i = 0; i < messages.length(); i++) {
-                JSONObject item = messages.optJSONObject(i);
-                if (item == null) {
-                    continue;
-                }
-                String role = item.optString("role", "");
-                String content = item.optString("content", "");
-                if (content.isEmpty()) {
-                    continue;
-                }
-                String author = role.equals("user") ? "Вы" : persona;
-                rendered.append(renderMessage(author, content)).append("\n");
-            }
-            rendered.append("Система:\nИстория синхронизирована с сервером.\n\n");
+            String rendered = renderServerMessages(messages);
+            int remoteCount = countRenderedMessages(rendered);
             mainHandler.post(() -> {
-                historyView.setText(rendered.toString());
-                prefs.edit().putString("history", rendered.toString()).apply();
+                String current = historyView.getText().toString();
+                int localCount = countRenderedMessages(current);
+                if (remoteCount < localCount) {
+                    return;
+                }
+                if (!rendered.equals(current)) {
+                    historyView.setText(rendered);
+                    prefs.edit().putString("history", rendered).apply();
+                    scrollToBottom();
+                }
             });
         } catch (Exception ignored) {
             // Keep local history when offline or when token is not set yet.
         }
+    }
+
+    private String renderServerMessages(JSONArray messages) {
+        StringBuilder rendered = new StringBuilder();
+        for (int i = 0; i < messages.length(); i++) {
+            JSONObject item = messages.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            String role = item.optString("role", "");
+            String content = item.optString("content", "");
+            if (content.isEmpty()) {
+                continue;
+            }
+            String author = role.equals("user") ? "Вы" : persona;
+            rendered.append(renderMessage(author, content));
+        }
+        return rendered.toString();
     }
 
     private void sendCurrentText() {
@@ -311,6 +331,7 @@ public class MainActivity extends Activity {
         String next = current + renderMessage(author, text);
         historyView.setText(next);
         prefs.edit().putString("history", next).apply();
+        scrollToBottom();
     }
 
     private String renderMessage(String author, String text) {
@@ -364,6 +385,24 @@ public class MainActivity extends Activity {
             cleaned = cleaned.substring(0, cleaned.length() - 1).trim();
         }
         return cleaned;
+    }
+
+    private int countRenderedMessages(String rendered) {
+        int count = 0;
+        String[] lines = rendered.split("\\r?\\n");
+        for (String line : lines) {
+            if (line.equals("Вы:") || line.equals("ANA:") || line.equals("ALIEN:") || line.equals("Ошибка:")) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private void scrollToBottom() {
+        if (scrollView == null) {
+            return;
+        }
+        scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
     }
 
     private void setWaiting(boolean waiting) {

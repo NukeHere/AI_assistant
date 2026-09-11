@@ -52,6 +52,15 @@ class ChatApp(tk.Tk):
         self.persona = "ANA"
         self.chat_log = self._load_local_history()
 
+        quick = tk.Frame(self)
+        quick.pack(fill=tk.X, padx=12, pady=(8, 0))
+        tk.Button(quick, text="Sync", command=self._sync_history_async).pack(side=tk.LEFT)
+        tk.Button(quick, text="↓ вниз", command=self._scroll_to_bottom).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="ANA", command=lambda: self._send_quick("/ana")).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="ALIEN", command=lambda: self._send_quick("/alien")).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="Память", command=lambda: self._send_quick("/memory")).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="Функции", command=lambda: self._send_quick("/functions")).pack(side=tk.LEFT, padx=(6, 0))
+
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
         self._configure_history_tags()
         self.history.bind("<Button-1>", self._focus_history)
@@ -73,9 +82,9 @@ class ChatApp(tk.Tk):
         if self.chat_log:
             for entry in self.chat_log:
                 self._append(entry.get("author", "Система"), entry.get("text", ""), persist=False)
-            self._append("Система", "Локальная история восстановлена. Контекст сервера продолжает тот же conversation_id.", persist=False)
+            self._append("Система", "Локальная история восстановлена. Сейчас сверю её с сервером.", persist=False)
         else:
-            self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory.")
+            self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /functions.")
         self.after(100, self._poll_results)
         self.after(200, self._sync_history_async)
         self.after(500, self._restore_snapshot_async)
@@ -115,7 +124,7 @@ class ChatApp(tk.Tk):
         for suffix in ["/v1/message", "/v1/history", "/v1/snapshot", "/v1/chat/simple"]:
             if stripped.endswith(suffix):
                 return stripped[: -len(suffix)] + endpoint
-        return None
+        return stripped + endpoint if stripped.startswith("http") else None
 
     def _snapshot_url(self) -> str | None:
         return self._endpoint_url("/v1/snapshot")
@@ -185,7 +194,6 @@ class ChatApp(tk.Tk):
         try:
             snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
             self._snapshot_request({"action": "import", "client_id": CLIENT_ID, "snapshot": snapshot}, timeout=45)
-            self.results.put(("system", "Локальный snapshot памяти синхронизирован с сервером."))
         except (OSError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
             return
 
@@ -244,6 +252,10 @@ class ChatApp(tk.Tk):
         self.clipboard_append(selected_text)
         return "break"
 
+    def _send_quick(self, text: str) -> None:
+        self.input.delete("1.0", tk.END)
+        self.input.insert("1.0", text)
+        self.send_message()
     def send_message(self, event: object | None = None) -> str:
         text = self.input.get("1.0", tk.END).strip()
         if not text:
@@ -310,7 +322,7 @@ class ChatApp(tk.Tk):
         if kind == "assistant":
             self._append(self.persona, text)
         elif kind == "history":
-            self._replace_history(json.loads(text))
+            self._merge_history(json.loads(text))
         elif kind == "system":
             self._append("Система", text, persist=False)
         else:
@@ -319,15 +331,37 @@ class ChatApp(tk.Tk):
 
         self.after(100, self._poll_results)
 
-    def _replace_history(self, entries: list[dict[str, str]]) -> None:
-        self.chat_log = entries[-HISTORY_KEEP:]
+    def _merge_history(self, entries: list[dict[str, str]]) -> None:
+        merged = self._merge_entries(self.chat_log, entries)
+        if merged == self.chat_log:
+            return
+        self.chat_log = merged[-HISTORY_KEEP:]
         self._save_local_history()
+        self._render_history()
+
+    def _merge_entries(self, local: list[dict[str, str]], remote: list[dict[str, str]]) -> list[dict[str, str]]:
+        merged: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for source in (local, remote):
+            for entry in source:
+                author = str(entry.get("author") or "Система")
+                content = str(entry.get("text") or "")
+                if not content or author == "Система":
+                    continue
+                key = (author, content)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append({"author": author, "text": content})
+        return merged
+
+    def _render_history(self) -> None:
         self.history.configure(state=tk.NORMAL)
         self.history.delete("1.0", tk.END)
         self.history.configure(state=tk.DISABLED)
         for entry in self.chat_log:
             self._append(entry.get("author", "Система"), entry.get("text", ""), persist=False)
-        self._append("Система", "История синхронизирована с сервером.", persist=False)
+        self._scroll_to_bottom()
 
     def _append(self, author: str, text: str, persist: bool = True) -> None:
         if persist:
@@ -342,7 +376,7 @@ class ChatApp(tk.Tk):
         else:
             self.history.insert(tk.END, f"{text}\n\n", (author_tag,))
         self.history.configure(state=tk.DISABLED)
-        self.history.see(tk.END)
+        self._scroll_to_bottom()
 
     def _insert_assistant_text(self, author: str, text: str) -> None:
         block_tag = "block_alien" if author == "ALIEN" else "block_ana"
@@ -366,6 +400,9 @@ class ChatApp(tk.Tk):
         if author == "ALIEN":
             return "alien"
         return "ana"
+
+    def _scroll_to_bottom(self) -> None:
+        self.after_idle(lambda: self.history.see(tk.END))
 
     def _set_waiting(self, waiting: bool) -> None:
         self.send_button.configure(state=tk.DISABLED if waiting else tk.NORMAL)
