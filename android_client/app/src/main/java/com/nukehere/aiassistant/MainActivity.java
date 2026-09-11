@@ -48,6 +48,7 @@ public class MainActivity extends Activity {
     private static final String CONVERSATION_ID = "default";
     private static final String DEVICE_ID = "android-" + android.os.Build.MODEL.replaceAll("[^a-zA-Z0-9_.-]+", "_");
     private static final int HISTORY_KEEP = 400;
+    private static final long AUTO_SYNC_MS = 10000L;
     private static final Pattern STRUCTURED_LINE = Pattern.compile(
             "^\\s*(?:[-*]\\s*)?(?:\\*\\*)?(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)(?:\\*\\*)?\\s*:\\s*(.*)$",
             Pattern.CASE_INSENSITIVE
@@ -74,8 +75,15 @@ public class MainActivity extends Activity {
         buildUi();
         renderHistory();
         syncHistory(false);
+        scheduleAutoSync();
     }
 
+    private void scheduleAutoSync() {
+        mainHandler.postDelayed(() -> {
+            syncHistory(false);
+            scheduleAutoSync();
+        }, AUTO_SYNC_MS);
+    }
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -264,6 +272,7 @@ public class MainActivity extends Activity {
                 renderHistory();
                 setWaiting(false);
                 syncHistory(false);
+        scheduleAutoSync();
             });
         } catch (Exception error) {
             mainHandler.post(() -> {

@@ -47,6 +47,7 @@ LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_a
 HISTORY_PATH = LOCAL_DATA_DIR / f"history-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
 SNAPSHOT_PATH = LOCAL_DATA_DIR / f"snapshot-{safe_name(CLIENT_ID)}.json"
 HISTORY_KEEP = int(os.getenv("ASSISTANT_LOCAL_HISTORY_KEEP", "400"))
+SYNC_INTERVAL_MS = max(5, int(os.getenv("ASSISTANT_SYNC_INTERVAL_SECONDS", "10"))) * 1000
 
 
 class ChatApp(tk.Tk):
@@ -96,6 +97,7 @@ class ChatApp(tk.Tk):
         self.after(100, self._poll_results)
         self.after(200, self._sync_history_async)
         self.after(500, self._restore_snapshot_async)
+        self.after(SYNC_INTERVAL_MS, self._periodic_sync)
 
     def _configure_history_tags(self) -> None:
         self.history.tag_configure("author", font=("TkDefaultFont", 10, "bold"))
@@ -167,6 +169,9 @@ class ChatApp(tk.Tk):
     def _sync_url(self) -> str | None:
         return self._endpoint_url("/v1/sync")
 
+    def _periodic_sync(self) -> None:
+        self._sync_history_async()
+        self.after(SYNC_INTERVAL_MS, self._periodic_sync)
     def _sync_history_async(self) -> None:
         if self._sync_url() is None or self._sync_running:
             return
