@@ -27,6 +27,8 @@
 - UI-оформление structured-блоков `Observation`, `Diagnosis`, `Action`, `Explanation`, `Conclusion`.
 - Команда `/functions` и системный список возможностей, чтобы модель знала свои доступные функции и ограничения.
 - Snapshot памяти/истории через `/v1/snapshot`: desktop-клиент хранит локальную копию и восстанавливает Render после redeploy/restart.
+- Синхронизация истории между устройствами через `/v1/history`: desktop и Android подтягивают серверный чат по общему `client_id`/`conversation_id`.
+- Очистка Markdown/structured-разметки в клиентах: `**...**`, code ticks, заголовки и служебные labels отображаются аккуратнее.
 - Заготовки под backup и следующий голосовой слой.
 - Подготовка к деплою: `Dockerfile`, `render.yaml`, стандартный `PORT`.
 

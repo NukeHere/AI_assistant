@@ -11,35 +11,7 @@ from tkinter import messagebox, scrolledtext
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-
-STRUCTURED_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?"
-    r"(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)"
-    r"(?:\*\*)?\s*:\s*(.*)$",
-    re.IGNORECASE,
-)
-
-ANA_BLOCK_LABELS = {
-    "observation": "НАБЛЮДЕНИЕ",
-    "diagnostic": "ДИАГНОСТИКА",
-    "diagnosis": "ДИАГНОСТИКА",
-    "recommended action": "ДЕЙСТВИЕ",
-    "command action": "КОМАНДА",
-    "action": "ДЕЙСТВИЕ",
-    "explanation": "ОБЪЯСНЕНИЕ",
-    "conclusion": "ВЫВОД",
-}
-
-ALIEN_BLOCK_LABELS = {
-    "observation": "СИГНАЛ",
-    "diagnostic": "ДИССОНАНС",
-    "diagnosis": "ДИССОНАНС",
-    "recommended action": "НОТА ДЕЙСТВИЯ",
-    "command action": "КОМАНДНАЯ НОТА",
-    "action": "НОТА ДЕЙСТВИЯ",
-    "explanation": "ГЛУБИНА",
-    "conclusion": "РЕЗОНАНС",
-}
+from app.text_render import strip_inline_markdown, structured_parts
 
 
 def load_local_env() -> None:
@@ -105,7 +77,8 @@ class ChatApp(tk.Tk):
         else:
             self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory.")
         self.after(100, self._poll_results)
-        self.after(300, self._restore_snapshot_async)
+        self.after(200, self._sync_history_async)
+        self.after(500, self._restore_snapshot_async)
 
     def _configure_history_tags(self) -> None:
         self.history.tag_configure("author", font=("TkDefaultFont", 10, "bold"))
@@ -137,13 +110,70 @@ class ChatApp(tk.Tk):
         LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_PATH.write_text(json.dumps(self.chat_log[-HISTORY_KEEP:], ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _snapshot_url(self) -> str | None:
+    def _endpoint_url(self, endpoint: str) -> str | None:
         stripped = API_URL.rstrip("/")
-        if stripped.endswith("/v1/message"):
-            return stripped[: -len("/v1/message")] + "/v1/snapshot"
-        if stripped.endswith("/v1/history"):
-            return stripped[: -len("/v1/history")] + "/v1/snapshot"
+        for suffix in ["/v1/message", "/v1/history", "/v1/snapshot", "/v1/chat/simple"]:
+            if stripped.endswith(suffix):
+                return stripped[: -len(suffix)] + endpoint
         return None
+
+    def _snapshot_url(self) -> str | None:
+        return self._endpoint_url("/v1/snapshot")
+
+    def _history_url(self) -> str | None:
+        return self._endpoint_url("/v1/history")
+
+    def _sync_history_async(self) -> None:
+        if self._history_url() is None:
+            return
+        thread = threading.Thread(target=self._sync_history_from_server, daemon=True)
+        thread.start()
+
+    def _sync_history_from_server(self) -> None:
+        try:
+            data = self._history_request(timeout=45)
+            raw_messages = data.get("messages")
+            if not isinstance(raw_messages, list):
+                return
+            entries: list[dict[str, str]] = []
+            for item in raw_messages:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if not isinstance(role, str) or not isinstance(content, str):
+                    continue
+                if role == "user":
+                    entries.append({"author": "Вы", "text": content})
+                elif role == "assistant":
+                    entries.append({"author": str(data.get("persona") or self.persona), "text": content})
+            if entries:
+                self.results.put(("history", json.dumps(entries[-HISTORY_KEEP:], ensure_ascii=False)))
+        except (OSError, HTTPError, URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError):
+            return
+
+    def _history_request(self, timeout: int) -> dict[str, object]:
+        history_url = self._history_url()
+        if history_url is None:
+            raise ValueError("History endpoint is unavailable for this API_URL")
+        payload = json.dumps(
+            {"client_id": CLIENT_ID, "conversation_id": CONVERSATION_ID, "limit": HISTORY_KEEP},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = Request(
+            history_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("History response must be an object")
+        return data
 
     def _restore_snapshot_async(self) -> None:
         if not SNAPSHOT_PATH.exists() or self._snapshot_url() is None:
@@ -279,6 +309,8 @@ class ChatApp(tk.Tk):
         self._set_waiting(False)
         if kind == "assistant":
             self._append(self.persona, text)
+        elif kind == "history":
+            self._replace_history(json.loads(text))
         elif kind == "system":
             self._append("Система", text, persist=False)
         else:
@@ -286,6 +318,17 @@ class ChatApp(tk.Tk):
             self._append("Ошибка", text)
 
         self.after(100, self._poll_results)
+
+    def _replace_history(self, entries: list[dict[str, str]]) -> None:
+        self.chat_log = entries[-HISTORY_KEEP:]
+        self._save_local_history()
+        self.history.configure(state=tk.NORMAL)
+        self.history.delete("1.0", tk.END)
+        self.history.configure(state=tk.DISABLED)
+        for entry in self.chat_log:
+            self._append(entry.get("author", "Система"), entry.get("text", ""), persist=False)
+        self._append("Система", "История синхронизирована с сервером.", persist=False)
+
     def _append(self, author: str, text: str, persist: bool = True) -> None:
         if persist:
             self.chat_log.append({"author": author, "text": text})
@@ -304,19 +347,15 @@ class ChatApp(tk.Tk):
     def _insert_assistant_text(self, author: str, text: str) -> None:
         block_tag = "block_alien" if author == "ALIEN" else "block_ana"
         label_tag = "block_label_alien" if author == "ALIEN" else "block_label_ana"
-        labels = ALIEN_BLOCK_LABELS if author == "ALIEN" else ANA_BLOCK_LABELS
-
         for raw_line in text.splitlines() or [""]:
-            match = STRUCTURED_LINE_RE.match(raw_line)
-            if match:
-                label_key = match.group(1).lower()
-                rest = match.group(2).strip()
-                label = labels.get(label_key, label_key.upper())
+            parts = structured_parts(author, raw_line)
+            if parts:
+                label, rest = parts
                 self.history.insert(tk.END, f"  {label}\n", (block_tag, label_tag))
                 if rest:
-                    self.history.insert(tk.END, f"  {rest}\n", (block_tag,))
+                    self.history.insert(tk.END, f"  {strip_inline_markdown(rest)}\n", (block_tag,))
             else:
-                self.history.insert(tk.END, f"{raw_line}\n", (self._author_tag(author),))
+                self.history.insert(tk.END, f"{strip_inline_markdown(raw_line)}\n", (self._author_tag(author),))
         self.history.insert(tk.END, "\n")
 
     def _author_tag(self, author: str) -> str:
