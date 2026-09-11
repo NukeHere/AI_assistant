@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.capabilities import CAPABILITIES_PROMPT, capabilities_answer
 from app.personas import (
     Persona,
     build_system_prompt,
@@ -94,6 +95,21 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
             "model_mode": provider_mode(),
         }
 
+    if lower in {"/functions", "/capabilities", "функции", "что ты умеешь"} or lower.startswith("что ты можешь"):
+        storage.add_message(conversation_id, "user", text)
+        answer = capabilities_answer(persona)
+        storage.add_message(conversation_id, "assistant", answer)
+        return {
+            "conversation_id": conversation_id,
+            "persona": persona.value,
+            "switched": False,
+            "memory_updated": False,
+            "memory_saved": 0,
+            "memory_recalled": 0,
+            "text": answer,
+            "model_mode": provider_mode(),
+        }
+
     if lower in {"/memory", "/memories", "память"} or lower.startswith("что ты помнишь"):
         storage.add_message(conversation_id, "user", text)
         memories = storage.list_memories(client_id, limit=20)
@@ -122,6 +138,7 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
 def build_messages_for_model(client_id: str, conversation_id: str, text: str, persona: Persona) -> list[dict[str, str]]:
     alien_glossary = storage.alien_glossary(conversation_id)
     system_prompt = build_system_prompt(persona, alien_glossary)
+    system_prompt += "\n\n" + CAPABILITIES_PROMPT
     system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
 
     memory_summaries = storage.memory_summaries_for_prompt(client_id, text)
@@ -320,7 +337,7 @@ def valid_messages(value: object) -> bool:
 
 
 class AssistantHandler(BaseHTTPRequestHandler):
-    server_version = "AIAssistantSimple/0.4"
+    server_version = "AIAssistantSimple/0.5"
 
     def do_GET(self) -> None:
         if self.path != "/health":

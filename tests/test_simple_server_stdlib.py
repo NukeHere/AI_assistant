@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import simple_server
+from app.capabilities import CAPABILITIES_PROMPT
 from app.personas import Persona, build_system_prompt, detect_persona_switch, extract_alien_glossary_terms
 from app.smart_memory import extract_memory_directive
 from app.storage import Storage
@@ -85,6 +86,38 @@ class SimpleServerTests(unittest.TestCase):
 
         self.assertTrue(stored["memory_updated"])
         self.assertIn("AI Assistant", listed["text"])
+
+    def test_functions_command_lists_available_capabilities(self) -> None:
+        with isolated_storage():
+            response = handle_message_request(
+                {
+                    "client_id": "primary-user",
+                    "conversation_id": "functions-test",
+                    "text": "/functions",
+                }
+            )
+
+        self.assertIn("/ana", response["text"])
+        self.assertIn("/alien", response["text"])
+        self.assertIn("/memory", response["text"])
+        self.assertIn("Умная память", response["text"])
+        self.assertIn("Conclusion", response["text"])
+
+    def test_model_system_prompt_contains_available_functions(self) -> None:
+        with isolated_storage():
+            messages = simple_server.build_messages_for_model(
+                "primary-user",
+                "prompt-functions-test",
+                "Что ты умеешь?",
+                Persona.ANA,
+            )
+
+        system_prompt = messages[0]["content"]
+        self.assertIn("Available assistant functions and boundaries", system_prompt)
+        self.assertIn("/functions", system_prompt)
+        self.assertIn("assistant_memory recall", system_prompt)
+        self.assertIn("Current limits", system_prompt)
+        self.assertIn(CAPABILITIES_PROMPT, system_prompt)
 
     def test_model_memory_directive_is_saved_and_hidden(self) -> None:
         old_complete = simple_server.complete
