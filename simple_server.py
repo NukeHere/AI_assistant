@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +43,12 @@ CLIENT_HISTORY_LIMIT = int(os.getenv("CLIENT_HISTORY_LIMIT", "20"))
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "primary-user")
 DEFAULT_CONVERSATION_ID = os.getenv("DEFAULT_CONVERSATION_ID", "default")
 ASSISTANT_TIMEZONE = os.getenv("ASSISTANT_TIMEZONE", "Europe/Moscow")
+TG_BOT_API_KEY = os.getenv("TG_BOT_API_KEY", "")
+TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET", "")
+TG_BOT_USERNAME = os.getenv("TG_BOT_USERNAME", "").lstrip("@")
+TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
+TG_SECRETARY_MODE = os.getenv("TG_SECRETARY_MODE", "true").lower() not in {"0", "false", "no", "off"}
+TG_BOT_TO_BOT = os.getenv("TG_BOT_TO_BOT", "true").lower() not in {"0", "false", "no", "off"}
 
 storage = Storage(DATABASE_PATH)
 
@@ -165,6 +172,21 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
             switched=False,
             memory_updated=True,
             memory_saved=1,
+            memory_recalled=0,
+            model_mode=provider_mode(),
+        )
+
+    if lower in {"/id", "id", "мой id", "мой app id", "app id"}:
+        storage.add_message(conversation_id, "user", text)
+        answer = f"Твой app client_id: `{client_id}`\nconversation_id: `{conversation_id}`\nДля привязки Telegram напиши боту: /link {client_id}"
+        storage.add_message(conversation_id, "assistant", answer)
+        return response_payload(
+            conversation_id,
+            persona.value,
+            answer,
+            switched=False,
+            memory_updated=False,
+            memory_saved=0,
             memory_recalled=0,
             model_mode=provider_mode(),
         )
@@ -370,6 +392,150 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     )
 
 
+def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
+    if not TG_BOT_API_KEY:
+        return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
+    message = body.get("message") or body.get("edited_message")
+    if not isinstance(message, dict):
+        return {"ok": True, "ignored": True, "reason": "no_message"}
+    text = str(message.get("text") or "").strip()
+    if not text:
+        return {"ok": True, "ignored": True, "reason": "no_text"}
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+    chat_id = chat.get("id")
+    telegram_user_id = str(sender.get("id") or "").strip()
+    if chat_id is None or not telegram_user_id:
+        return {"ok": True, "ignored": True, "reason": "no_chat_or_user"}
+    is_bot = bool(sender.get("is_bot"))
+    if is_bot and not TG_BOT_TO_BOT:
+        return {"ok": True, "ignored": True, "reason": "bot_sender"}
+
+    user = storage.upsert_telegram_user(
+        telegram_user_id=telegram_user_id,
+        username=str(sender.get("username") or ""),
+        first_name=str(sender.get("first_name") or ""),
+        last_name=str(sender.get("last_name") or ""),
+        is_bot=is_bot,
+    )
+    command_text = normalize_telegram_command(text)
+    chat_type = str(chat.get("type") or "private")
+    linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id)
+
+    if should_ignore_telegram_message(command_text, chat_type, is_authorized):
+        return {"ok": True, "ignored": True, "reason": "secretary_mode"}
+
+    if command_text.startswith("/start"):
+        reply = telegram_start_text(user, linked_client_id, is_authorized)
+        send_telegram_message(chat_id, reply)
+        return {"ok": True, "handled": "start"}
+    if command_text.startswith("/link"):
+        parts = command_text.split(maxsplit=1)
+        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9_.-]{3,128}", parts[1].strip()):
+            send_telegram_message(chat_id, "Пришли app client_id так: /link primary-user. В приложении его можно узнать командой /id.")
+            return {"ok": True, "handled": "link_help"}
+        linked = storage.link_telegram_user(telegram_user_id, parts[1].strip())
+        migrated = migrate_guest_memories(str(linked.get("guest_client_id") or ""), str(linked.get("app_client_id") or ""))
+        send_telegram_message(chat_id, f"Готово. Telegram привязан к app client_id: {linked['app_client_id']}. Перенесено guest-memory: {migrated}.")
+        return {"ok": True, "handled": "linked", "migrated_memories": migrated}
+    if command_text.startswith("/unlink"):
+        storage.unlink_telegram_user(telegram_user_id)
+        send_telegram_message(chat_id, "Привязка Telegram отключена. Дальше будет гостевой режим.")
+        return {"ok": True, "handled": "unlinked"}
+    if command_text.startswith("/whoami") or command_text.startswith("/id"):
+        app_id = linked_client_id
+        state = "authorized" if is_authorized else "guest"
+        send_telegram_message(chat_id, f"Telegram id: {telegram_user_id}\nusername: @{user.get('username') or '-'}\nmode: {state}\napp client_id: {app_id}")
+        return {"ok": True, "handled": "whoami"}
+
+    if not is_authorized and not TG_GUEST_CHAT_MODE:
+        send_telegram_message(chat_id, "Сейчас включён только авторизованный режим. Напиши /link app_client_id.")
+        return {"ok": True, "handled": "guest_disabled"}
+
+    conversation_id = DEFAULT_CONVERSATION_ID if is_authorized else f"telegram-{telegram_user_id}"
+    user_text = command_text
+    if not is_authorized:
+        user_text = f"[Telegram guest @{user.get('username') or telegram_user_id}] {command_text}"
+    payload = handle_message_request({
+        "client_id": linked_client_id,
+        "conversation_id": conversation_id,
+        "text": user_text,
+    })
+    send_telegram_message(chat_id, str(payload.get("text") or ""))
+    return {"ok": True, "handled": "message", "authorized": is_authorized}
+
+
+def normalize_telegram_command(text: str) -> str:
+    stripped = text.strip()
+    if TG_BOT_USERNAME:
+        stripped = re.sub(rf"^(/\w+)@{re.escape(TG_BOT_USERNAME)}\b", r"\1", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(rf"@{re.escape(TG_BOT_USERNAME)}\b", "", stripped, flags=re.IGNORECASE).strip()
+    return stripped
+
+
+def should_ignore_telegram_message(text: str, chat_type: str, is_authorized: bool) -> bool:
+    if not TG_SECRETARY_MODE:
+        return False
+    if text.startswith("/"):
+        return False
+    if chat_type == "private":
+        return False
+    if is_authorized:
+        return not is_telegram_mention(text)
+    return True
+
+
+def is_telegram_mention(text: str) -> bool:
+    lowered = text.lower()
+    if TG_BOT_USERNAME and f"@{TG_BOT_USERNAME.lower()}" in lowered:
+        return True
+    return any(word in lowered for word in ["ана", "alien", "алиен", "бот"] )
+
+
+def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: bool) -> str:
+    username = user.get("username") or user.get("first_name") or "гость"
+    if is_authorized:
+        return f"Привет, {username}. Telegram уже привязан к app client_id: {client_id}. Пиши сюда — я синхронизируюсь с основной памятью."
+    return (
+        f"Привет, {username}. Я AI Assistant в гостевом Telegram-режиме.\n"
+        "Чтобы связать меня с desktop/Android, в приложении напиши /id, затем сюда отправь /link app_client_id.\n"
+        f"Пока твой временный guest client_id: {client_id}."
+    )
+
+
+def send_telegram_message(chat_id: object, text: str) -> None:
+    if not TG_BOT_API_KEY:
+        return
+    clean_text = text.strip() or "..."
+    payload = json.dumps({"chat_id": chat_id, "text": clean_text[:3800]}, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{TG_BOT_API_KEY}/sendMessage",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=30) as response:
+        response.read()
+
+
+def migrate_guest_memories(guest_client_id: str, app_client_id: str) -> int:
+    if not guest_client_id or not app_client_id or guest_client_id == app_client_id:
+        return 0
+    memories = storage.list_memories(guest_client_id, limit=20)
+    migrated = 0
+    for memory in memories:
+        storage.add_memory_cell(
+            client_id=app_client_id,
+            kind="telegram_guest",
+            summary=str(memory.get("summary") or memory.get("content") or "")[:240],
+            full_content=str(memory.get("full_content") or memory.get("content") or ""),
+            topics=["telegram", "guest"],
+            importance=min(3, int(memory.get("importance") or 1)),
+        )
+        migrated += 1
+    return migrated
+
+
 def complete_openai_compatible(messages: list[dict[str, str]]) -> str:
     if not MODEL_API_KEY:
         raise RuntimeError("MODEL_API_KEY is required for openai-compatible provider")
@@ -474,12 +640,29 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "smart_memory": True,
                 "render_blocks": True,
                 "timed_memory": True,
+                "telegram_webhook": bool(TG_BOT_API_KEY),
                 "server_time_utc": current_times()[0],
                 "server_timezone": ASSISTANT_TIMEZONE,
             }
         )
 
     def do_POST(self) -> None:
+        if self.path == "/v1/telegram/webhook":
+            if not TG_BOT_API_KEY:
+                self.send_json({"error": "Telegram is not configured"}, status=404)
+                return
+            if not self.telegram_authorized():
+                self.send_json({"error": "Unauthorized"}, status=401)
+                return
+            try:
+                body = self.read_json_body()
+                self.send_json(handle_telegram_update(body))
+            except ValueError as error:
+                self.send_json({"error": str(error)}, status=400)
+            except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
+                self.send_json({"error": f"Telegram request failed: {error}"}, status=502)
+            return
+
         if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync"}:
             self.send_json({"error": "Not found"}, status=404)
             return
@@ -537,6 +720,11 @@ class AssistantHandler(BaseHTTPRequestHandler):
     def authorized(self) -> bool:
         return self.headers.get("Authorization") == f"Bearer {API_TOKEN}"
 
+    def telegram_authorized(self) -> bool:
+        if not TG_WEBHOOK_SECRET:
+            return True
+        return self.headers.get("X-Telegram-Bot-Api-Secret-Token") == TG_WEBHOOK_SECRET
+
     def send_json(self, payload: dict[str, object], status: int = 200) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -553,7 +741,7 @@ def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
-    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/chat/simple", flush=True)
+    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 

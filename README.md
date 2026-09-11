@@ -29,6 +29,7 @@
 - Snapshot памяти/истории через `/v1/snapshot`: desktop-клиент хранит локальную копию и восстанавливает Render после redeploy/restart.
 - Синхронизация истории между устройствами через `/v1/history`: desktop и Android подтягивают серверный чат по общему `client_id`/`conversation_id`.
 - Очистка Markdown/structured-разметки в клиентах: `**...**`, code ticks, заголовки и служебные labels отображаются аккуратнее.
+- Telegram-интерфейс как дополнительный канал общения: guest mode, `/link <client_id>`, `/whoami`, secretary-mode фильтрация шума.
 - Заготовки под backup и следующий голосовой слой.
 - Подготовка к деплою: `Dockerfile`, `render.yaml`, стандартный `PORT`.
 
@@ -98,6 +99,19 @@ Android Studio-проект лежит в [android_client](android_client). По
 [android_client/README.md](android_client/README.md).
 
 Токен в Android-клиент вводится руками в поле `APP_API_TOKEN`. В коде его нет.
+
+
+## Telegram
+
+Telegram-бот подключается как дополнительный интерфейс к тому же серверу, памяти и синхронизации. Подробности — в [docs/telegram.md](docs/telegram.md).
+
+Быстрый сценарий:
+
+1. В desktop или Android отправь `/id`.
+2. В Telegram напиши боту `/link <client_id>`.
+3. После привязки сообщения из Telegram идут в тот же `client_id` и синхронизируются с основными приложениями.
+
+На Render нужно задать `TG_BOT_API_KEY`; для защищённого webhook желательно также `TG_WEBHOOK_SECRET`.
 
 ## Голосовой режим
 

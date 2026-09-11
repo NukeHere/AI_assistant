@@ -253,6 +253,56 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(imported["ok"])
         self.assertIn("Render", listed["text"])
 
+    def test_id_command_exposes_client_link_hint(self) -> None:
+        with isolated_storage():
+            response = handle_message_request(
+                {"client_id": "primary-user", "conversation_id": "id-test", "text": "/id"}
+            )
+
+        self.assertIn("primary-user", response["text"])
+        self.assertIn("/link primary-user", response["text"])
+
+    def test_telegram_start_link_and_message_use_app_client_id(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                start = simple_server.handle_telegram_update(telegram_update("/start"))
+                linked = simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                message = simple_server.handle_telegram_update(telegram_update("Привет из Telegram"))
+                history = handle_history_request(
+                    {"client_id": "primary-user", "conversation_id": "default", "limit": 10}
+                )
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(start["handled"], "start")
+        self.assertEqual(linked["handled"], "linked")
+        self.assertEqual(message["handled"], "message")
+        self.assertTrue(message["authorized"])
+        self.assertTrue(any("Привет из Telegram" in item["content"] for item in history["messages"]))
+        self.assertTrue(any("Telegram привязан" in item[1] for item in sent))
+
+    def test_telegram_secretary_ignores_guest_group_chatter(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        simple_server.TG_BOT_API_KEY = "test-token"
+        try:
+            with isolated_storage():
+                response = simple_server.handle_telegram_update(telegram_update("просто шум в группе", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+
+        self.assertTrue(response["ignored"])
+        self.assertEqual(response["reason"], "secretary_mode")
+
     def test_alien_glossary_extracts_stable_terms(self) -> None:
         terms = extract_alien_glossary_terms("API сервера отдаёт ошибку")
 
@@ -301,6 +351,22 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(detect_persona_switch(sample_cases[9]), Persona.ALIEN)
         self.assertEqual(detect_persona_switch(sample_cases[11]), Persona.ANA)
 
+
+def telegram_update(text: str, chat_type: str = "private") -> dict[str, object]:
+    return {
+        "message": {
+            "message_id": 10,
+            "date": 1800000000,
+            "chat": {"id": 555, "type": chat_type},
+            "from": {
+                "id": 777,
+                "is_bot": False,
+                "username": "telegram_user",
+                "first_name": "Telegram",
+            },
+            "text": text,
+        }
+    }
 
 class isolated_storage:
     def __enter__(self) -> None:

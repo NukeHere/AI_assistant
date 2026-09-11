@@ -91,6 +91,22 @@ class Storage:
 
                 create index if not exists idx_timed_memories_due
                     on timed_memories (client_id, conversation_id, status, due_at);
+
+                create table if not exists telegram_users (
+                    telegram_user_id text primary key,
+                    app_client_id text,
+                    guest_client_id text not null,
+                    username text not null default '',
+                    first_name text not null default '',
+                    last_name text not null default '',
+                    is_bot integer not null default 0,
+                    is_authorized integer not null default 0,
+                    created_at text not null default current_timestamp,
+                    updated_at text not null default current_timestamp
+                );
+
+                create index if not exists idx_telegram_users_app_client
+                    on telegram_users (app_client_id);
                 """
             )
             self._ensure_column(conn, "memory_cells", "embedding_json", "text not null default '[]'")
@@ -787,6 +803,87 @@ class Storage:
             "messages": self.recent_messages(conversation_id, limit),
             "state": self.conversation_state(conversation_id),
         }
+
+    def upsert_telegram_user(
+        self,
+        telegram_user_id: str,
+        username: str = "",
+        first_name: str = "",
+        last_name: str = "",
+        is_bot: bool = False,
+    ) -> dict[str, Any]:
+        guest_client_id = "tg-guest-" + hashlib.sha256(telegram_user_id.encode("utf-8")).hexdigest()[:16]
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                insert into telegram_users
+                    (telegram_user_id, guest_client_id, username, first_name, last_name, is_bot, updated_at)
+                values (?, ?, ?, ?, ?, ?, current_timestamp)
+                on conflict(telegram_user_id) do update set
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    is_bot = excluded.is_bot,
+                    updated_at = current_timestamp
+                """,
+                (telegram_user_id, guest_client_id, username, first_name, last_name, 1 if is_bot else 0),
+            )
+            row = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
+        return dict(row)
+
+    def get_telegram_user(self, telegram_user_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def link_telegram_user(self, telegram_user_id: str, app_client_id: str) -> dict[str, Any]:
+        clean_client_id = app_client_id.strip()[:128]
+        if not clean_client_id:
+            raise ValueError("app_client_id is required")
+        with self._lock, self._connect() as conn:
+            existing = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
+            if existing is None:
+                guest_client_id = "tg-guest-" + hashlib.sha256(telegram_user_id.encode("utf-8")).hexdigest()[:16]
+                conn.execute(
+                    """
+                    insert into telegram_users (telegram_user_id, guest_client_id, app_client_id, is_authorized)
+                    values (?, ?, ?, 1)
+                    """,
+                    (telegram_user_id, guest_client_id, clean_client_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    update telegram_users
+                       set app_client_id = ?, is_authorized = 1, updated_at = current_timestamp
+                     where telegram_user_id = ?
+                    """,
+                    (clean_client_id, telegram_user_id),
+                )
+            row = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
+        return dict(row)
+
+    def unlink_telegram_user(self, telegram_user_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                update telegram_users
+                   set app_client_id = null, is_authorized = 0, updated_at = current_timestamp
+                 where telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            )
+            row = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def telegram_client_context(self, telegram_user_id: str) -> tuple[str, bool]:
+        user = self.get_telegram_user(telegram_user_id)
+        if user is None:
+            guest_client_id = "tg-guest-" + hashlib.sha256(telegram_user_id.encode("utf-8")).hexdigest()[:16]
+            return guest_client_id, False
+        if int(user.get("is_authorized") or 0) and user.get("app_client_id"):
+            return str(user["app_client_id"]), True
+        return str(user.get("guest_client_id") or "tg-guest-" + hashlib.sha256(telegram_user_id.encode("utf-8")).hexdigest()[:16]), False
 
     def conversation_state(self, conversation_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
