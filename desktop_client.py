@@ -10,6 +10,7 @@ from tkinter import messagebox, scrolledtext
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+
 def load_local_env() -> None:
     env_path = Path(__file__).resolve().with_name(".env")
     if not env_path.exists():
@@ -23,8 +24,10 @@ def load_local_env() -> None:
 
 
 load_local_env()
-API_URL = os.getenv("ASSISTANT_API_URL", "https://ai-assistant-4yn0.onrender.com/v1/chat/simple")
+API_URL = os.getenv("ASSISTANT_API_URL", "https://ai-assistant-4yn0.onrender.com/v1/message")
 API_TOKEN = os.getenv("APP_API_TOKEN", "dev-token")
+CLIENT_ID = os.getenv("ASSISTANT_CLIENT_ID", "desktop")
+CONVERSATION_ID = os.getenv("ASSISTANT_CONVERSATION_ID", "default")
 
 
 class ChatApp(tk.Tk):
@@ -34,13 +37,8 @@ class ChatApp(tk.Tk):
         self.geometry("760x620")
         self.minsize(520, 420)
 
-        self.messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant. Answer clearly and concisely.",
-            }
-        ]
         self.results: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.persona = "ANA"
 
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
         self.history.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
@@ -56,7 +54,7 @@ class ChatApp(tk.Tk):
         self.send_button = tk.Button(bottom, text="Отправить", command=self.send_message)
         self.send_button.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.Y)
 
-        self._append("Система", "Готово. Enter отправляет сообщение, Shift+Enter переносит строку.")
+        self._append("Система", "Готово. Режим по умолчанию: ANA. Команды: /ana и /alien.")
         self.after(100, self._poll_results)
 
     def _handle_enter(self, event: object | None = None) -> str:
@@ -72,17 +70,33 @@ class ChatApp(tk.Tk):
             return "break"
 
         self.input.delete("1.0", tk.END)
-        self.messages.append({"role": "user", "content": text})
         self._append("Вы", text)
         self._set_waiting(True)
 
-        thread = threading.Thread(target=self._request_answer, daemon=True)
+        thread = threading.Thread(target=self._request_answer, args=(text,), daemon=True)
         thread.start()
         return "break"
 
-    def _request_answer(self) -> None:
+    def _request_answer(self, text: str) -> None:
         try:
-            payload = json.dumps({"messages": self.messages}, ensure_ascii=False).encode("utf-8")
+            if API_URL.rstrip("/").endswith("/v1/chat/simple"):
+                payload_body = {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful AI assistant. Answer clearly and concisely.",
+                        },
+                        {"role": "user", "content": text},
+                    ]
+                }
+            else:
+                payload_body = {
+                    "client_id": CLIENT_ID,
+                    "conversation_id": CONVERSATION_ID,
+                    "text": text,
+                    "input_type": "text",
+                }
+            payload = json.dumps(payload_body, ensure_ascii=False).encode("utf-8")
             request = Request(
                 API_URL,
                 data=payload,
@@ -94,6 +108,9 @@ class ChatApp(tk.Tk):
             )
             with urlopen(request, timeout=90) as response:
                 data = json.loads(response.read().decode("utf-8"))
+            persona = data.get("persona")
+            if isinstance(persona, str):
+                self.persona = persona
             self.results.put(("assistant", data["text"]))
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
@@ -110,10 +127,8 @@ class ChatApp(tk.Tk):
 
         self._set_waiting(False)
         if kind == "assistant":
-            self.messages.append({"role": "assistant", "content": text})
-            self._append("Модель", text)
+            self._append(self.persona, text)
         else:
-            self.messages.pop()
             messagebox.showerror("Ошибка запроса", text)
             self._append("Ошибка", text)
 

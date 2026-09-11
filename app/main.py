@@ -8,7 +8,13 @@ from fastapi import Depends, FastAPI
 from app.backup import BackupService
 from app.config import settings
 from app.model_client import ModelClient
-from app.personas import Persona, build_system_prompt, confirmation_for, detect_persona_switch
+from app.personas import (
+    Persona,
+    build_system_prompt,
+    confirmation_for,
+    detect_persona_switch,
+    extract_alien_glossary_terms,
+)
 from app.schemas import (
     BackupResponse,
     HealthResponse,
@@ -96,6 +102,12 @@ async def message(request: MessageRequest) -> MessageResponse:
     messages.append({"role": "user", "content": request.text})
 
     storage.add_message(request.conversation_id, "user", request.text)
+    if active_persona == Persona.ALIEN:
+        storage.update_alien_glossary(
+            request.client_id,
+            request.conversation_id,
+            extract_alien_glossary_terms(request.text),
+        )
     answer = await model_client.complete(messages)
     storage.add_message(request.conversation_id, "assistant", answer)
 

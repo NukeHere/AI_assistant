@@ -111,6 +111,22 @@ class Storage:
         conversation = self.ensure_conversation("unknown", conversation_id)
         return json.loads(conversation.get("alien_glossary_json") or "{}")
 
+    def update_alien_glossary(self, client_id: str, conversation_id: str, terms: dict[str, str]) -> None:
+        if not terms:
+            return
+        conversation = self.ensure_conversation(client_id, conversation_id)
+        glossary = json.loads(conversation.get("alien_glossary_json") or "{}")
+        glossary.update(terms)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                update conversations
+                   set alien_glossary_json = ?, updated_at = current_timestamp
+                 where id = ?
+                """,
+                (json.dumps(glossary, ensure_ascii=False, sort_keys=True), conversation_id),
+            )
+
     def remember(self, client_id: str, kind: str, content: str, importance: int = 1) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(

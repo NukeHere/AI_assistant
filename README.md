@@ -1,21 +1,24 @@
 # AI Assistant Core
 
-Тестовая база для личного AI-агента. Первый этап максимально простой:
-локальное окно на ПК отправляет историю переписки на сервер, сервер передаёт её
-в LLM API и возвращает ответ.
+Тестовая база для личного AI-агента. Первый этап: локальное окно на ПК
+отправляет сообщение на сервер, сервер сам хранит контекст разговора, выбирает
+активный режим поведения, передаёт запрос в LLM API и возвращает ответ.
 
 ## Что уже есть
 
 - Простое desktop-окно на `tkinter`.
-- FastAPI server.
-- Endpoint `/v1/chat/simple`, который принимает готовую историю сообщений.
+- Лёгкий stdlib-сервер для Render без тяжёлых зависимостей.
+- FastAPI server как расширяемый каркас для следующих этапов.
+- Endpoint `/v1/message`, который хранит контекст разговора на сервере.
+- Legacy endpoint `/v1/chat/simple`, который принимает готовую историю сообщений.
 - Bearer-token защита клиентских запросов.
-- OpenAI-compatible LLM gateway.
+- OpenAI-compatible и Ollama LLM gateway.
 - Mock-режим без API-ключа для бесплатной проверки.
+- Режимы `ANA` и `ALIEN` с переключением через `/ana`, `/alien` и естественные фразы.
+- Сохранение режима и истории разговора между сообщениями.
+- Устойчивый словарь метафор ALIEN внутри разговора.
+- Заготовки под долгую память и backup.
 - Подготовка к деплою: `Dockerfile`, `render.yaml`, стандартный `PORT`.
-
-Заготовки под persona, память и backup уже лежат в проекте, но они не являются
-главным путём первого MVP.
 
 ## Быстрый запуск
 
@@ -54,10 +57,21 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ```powershell
 Invoke-RestMethod `
   -Method Post `
-  -Uri http://127.0.0.1:8000/v1/chat/simple `
+  -Uri http://127.0.0.1:8000/v1/message `
   -Headers @{ Authorization = "Bearer dev-token" } `
   -ContentType "application/json" `
-  -Body '{"messages":[{"role":"system","content":"You are helpful."},{"role":"user","content":"Привет"}]}'
+  -Body '{"client_id":"desktop","conversation_id":"default","text":"Привет"}'
+```
+
+Переключение режима:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/v1/message `
+  -Headers @{ Authorization = "Bearer dev-token" } `
+  -ContentType "application/json" `
+  -Body '{"client_id":"desktop","conversation_id":"default","text":"/alien"}'
 ```
 
 ## Реальная модель
@@ -115,4 +129,3 @@ $env:MODEL_NAME="your-model"
 Важно: бесплатный хостинг не сможет обращаться к локальному Ollama на твоём ПК.
 Для облака нужен Ollama API token, внешний OpenAI-compatible API или отдельный
 VPS, где модель доступна самому серверу.
-
