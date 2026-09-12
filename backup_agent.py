@@ -70,7 +70,7 @@ def backup_filename(client_id: str, now: datetime | None = None) -> str:
 def snapshot_weight(snapshot: dict[str, object]) -> int:
     return sum(
         len(snapshot.get(key, []))
-        for key in ["conversations", "messages", "memories", "memory_cells", "timed_memories"]
+        for key in ["conversations", "messages", "memories", "memory_cells", "timed_memories", "telegram_users"]
         if isinstance(snapshot.get(key, []), list)
     )
 

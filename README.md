@@ -30,6 +30,7 @@
 - Синхронизация истории между устройствами через `/v1/history`: desktop и Android подтягивают серверный чат по общему `client_id`/`conversation_id`.
 - Очистка Markdown/structured-разметки в клиентах: `**...**`, code ticks, заголовки и служебные labels отображаются аккуратнее.
 - Telegram-интерфейс как дополнительный канал общения: guest mode, `/link <client_id>`, `/whoami`, secretary-mode фильтрация шума.
+- Аудит-логи `/v1/logs` и `data/assistant-audit.jsonl`: входящие сообщения, routing/ignore-решения и счётчики памяти без секретов.
 - Заготовки под backup и следующий голосовой слой.
 - Подготовка к деплою: `Dockerfile`, `render.yaml`, стандартный `PORT`.
 

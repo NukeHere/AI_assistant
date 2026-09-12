@@ -68,6 +68,11 @@ class BackupAgentTests(unittest.TestCase):
         self.assertEqual(path, latest)
         self.assertEqual(calls[-1]["action"], "import")
 
+    def test_snapshot_weight_includes_telegram_links(self) -> None:
+        self.assertEqual(
+            backup_agent.snapshot_weight({"telegram_users": [{"telegram_user_id": "777", "app_client_id": "primary-user"}]}),
+            1,
+        )
     def test_latest_backup_can_use_desktop_snapshot_file(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             root = Path(temp_dir)

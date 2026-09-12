@@ -94,6 +94,8 @@ class ChatApp(tk.Tk):
         self.input.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.input.bind("<Return>", self._handle_enter)
         self.input.bind("<Shift-Return>", self._handle_shift_enter)
+        self.input.bind("<Control-a>", self._select_all_input)
+        self.input.bind("<Control-A>", self._select_all_input)
 
         self.send_button = tk.Button(bottom, text="Отправить", command=self.send_message)
         self.send_button.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.Y)
@@ -326,12 +328,19 @@ class ChatApp(tk.Tk):
         return "break"
 
     def _copy_history_or_default(self, event: object | None = None) -> str | None:
+        if self.focus_get() is not self.history:
+            return None
         try:
             self.history.get(tk.SEL_FIRST, tk.SEL_LAST)
         except tk.TclError:
             return None
         return self._copy_history_selection(event)
 
+    def _select_all_input(self, event: object | None = None) -> str:
+        self.input.tag_add(tk.SEL, "1.0", tk.END)
+        self.input.mark_set(tk.INSERT, "1.0")
+        self.input.see(tk.INSERT)
+        return "break"
     def _show_history_menu(self, event: tk.Event) -> str:
         try:
             self.history_menu.tk_popup(event.x_root, event.y_root)

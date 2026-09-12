@@ -373,6 +373,64 @@ class SimpleServerTests(unittest.TestCase):
         self.assertGreaterEqual(len(sent), 2)
 
 
+    def test_telegram_secretary_allows_group_username_mention_before_normalization(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_username = simple_server.TG_BOT_USERNAME
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.TG_BOT_USERNAME = "VBDsThirdSon_bot"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot ты живой?", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.TG_BOT_USERNAME = old_username
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertTrue(response["authorized"])
+        self.assertTrue(sent)
+
+    def test_telegram_secretary_allows_guest_group_direct_mention(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_username = simple_server.TG_BOT_USERNAME
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.TG_BOT_USERNAME = "VBDsThirdSon_bot"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                response = simple_server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot привет", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.TG_BOT_USERNAME = old_username
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertFalse(response["authorized"])
+        self.assertTrue(sent)
+
+    def test_telegram_addressing_uses_word_boundaries(self) -> None:
+        self.assertFalse(simple_server.is_telegram_addressed("просто работай дальше"))
+        self.assertTrue(simple_server.is_telegram_addressed("бот, ты тут?"))
+        self.assertTrue(simple_server.is_telegram_addressed("@VBDsThirdSon_bot ты тут?"))
+
+    def test_telegram_sender_mention_keeps_underscores(self) -> None:
+        mention = simple_server.telegram_sender_mention_text({"username": "Ne_gr_idi_rabotai"})
+
+        self.assertEqual(mention, "@Ne_gr_idi_rabotai")
     def test_memory_directive_parser_extracts_telegram_action(self) -> None:
         cleaned, directive = extract_memory_directive(
             'Ок.\n```assistant_memory\n{"telegram_action":{"reply_to":"private","mention_sender":true,"private_text":"Отвечу в личке."}}\n```'

@@ -8,7 +8,7 @@ Set these on Render:
 
 - `TG_BOT_API_KEY` — Telegram bot token from BotFather. Keep it secret.
 - `TG_WEBHOOK_SECRET` — optional but recommended secret for Telegram webhook requests.
-- `TG_BOT_USERNAME` — optional bot username without `@`, useful for group mentions.
+- `TG_BOT_USERNAME` — bot username without `@`, useful for group mentions. Default in code: `VBDsThirdSon_bot`.
 - `TG_GUEST_CHAT_MODE=true` — allow unlinked users to talk in guest mode.
 - `TG_SECRETARY_MODE=true` — ignore group noise unless the message is a command or mentions the bot.
 - `TG_BOT_TO_BOT=true` — allow bot-to-bot messages if you intentionally need them.
@@ -45,7 +45,23 @@ For token economy, the first implementation uses cheap rules instead of an extra
 
 - private messages are processed;
 - commands are processed;
-- guest group chatter is ignored;
-- authorized group messages are ignored unless they mention the bot or assistant keywords.
+- plain guest group chatter is ignored;
+- direct group mentions such as `@VBDsThirdSon_bot`, `бот`, `секретарь`, `ANA`, `ALIEN` are processed for both guest and authorized users;
+- authorized group messages without a direct mention are ignored as noise.
 
 Later this can be replaced by a tiny classifier prompt or local heuristic+embedding scorer.
+## Audit logs
+
+The server writes compact JSONL audit records without API tokens or webhook secrets. By default the file is `./data/assistant-audit.jsonl`; override it with `ASSISTANT_AUDIT_LOG_PATH`.
+
+Protected log tail endpoint:
+
+```text
+POST /v1/logs
+Authorization: Bearer <APP_API_TOKEN>
+{"limit":100}
+```
+
+Use this to see incoming desktop, Android and Telegram messages, routing decisions, ignored group messages, memory save/recall counters and Telegram response route.
+
+Telegram authorization links are included in `/v1/snapshot` as `telegram_users`, so the PC backup agent can preserve `telegram_user_id ↔ app_client_id ↔ username` across Render redeploys.
