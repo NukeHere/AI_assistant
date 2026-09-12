@@ -303,6 +303,54 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(response["ignored"])
         self.assertEqual(response["reason"], "secretary_mode")
 
+    def test_telegram_secretary_ignores_authorized_group_without_mention(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+
+        def fake_send(chat_id: object, text: str) -> None:
+            return None
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("просто общий разговор", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertTrue(response["ignored"])
+        self.assertEqual(response["reason"], "secretary_mode")
+
+    def test_telegram_secretary_allows_authorized_group_mention(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("бот, коротко ответь", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertTrue(response["authorized"])
+        self.assertGreaterEqual(len(sent), 2)
+
+    def test_telegram_message_html_removes_raw_markdown(self) -> None:
+        rendered = simple_server.telegram_message_html("**Observation:** Всё нормально\n**Conclusion:** Готово")
+
+        self.assertIn("<b>", rendered)
+        self.assertIn("Готово", rendered)
+        self.assertNotIn("**", rendered)
     def test_alien_glossary_extracts_stable_terms(self) -> None:
         terms = extract_alien_glossary_terms("API сервера отдаёт ошибку")
 
@@ -382,3 +430,4 @@ class isolated_storage:
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -77,6 +77,13 @@ class ChatApp(tk.Tk):
         self._configure_history_tags()
         self.history.bind("<Button-1>", self._focus_history)
         self.history.bind("<Control-c>", self._copy_history_selection)
+        self.history.bind("<Button-3>", self._show_history_menu)
+        self.history.bind("<Button-2>", self._show_history_menu)
+        self.bind_all("<Control-c>", self._copy_history_or_default, add="+")
+        self.bind_all("<Control-C>", self._copy_history_or_default, add="+")
+        self.history_menu = tk.Menu(self, tearoff=False)
+        self.history_menu.add_command(label="Копировать", command=self._copy_history_selection)
+        self.history_menu.add_command(label="Копировать всё", command=self._copy_all_history)
         self.history.bind("<Control-C>", self._copy_history_selection)
         self.history.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 8))
 
@@ -316,6 +323,27 @@ class ChatApp(tk.Tk):
             return "break"
         self.clipboard_clear()
         self.clipboard_append(selected_text)
+        return "break"
+
+    def _copy_history_or_default(self, event: object | None = None) -> str | None:
+        try:
+            self.history.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return None
+        return self._copy_history_selection(event)
+
+    def _show_history_menu(self, event: tk.Event) -> str:
+        try:
+            self.history_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.history_menu.grab_release()
+        return "break"
+
+    def _copy_all_history(self) -> str:
+        text = self.history.get("1.0", tk.END).strip()
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
         return "break"
 
     def _send_quick(self, text: str) -> None:

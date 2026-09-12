@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -253,10 +254,14 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
     return None
 
 
-def build_messages_for_model(client_id: str, conversation_id: str, text: str, persona: Persona) -> list[dict[str, str]]:
+def build_messages_for_model(client_id: str, conversation_id: str, text: str, persona: Persona, channel: str = "desktop") -> list[dict[str, str]]:
     alien_glossary = storage.alien_glossary(conversation_id)
     system_prompt = build_system_prompt(persona, alien_glossary)
     system_prompt += "\n\n" + CAPABILITIES_PROMPT
+    if channel == "telegram_group":
+        system_prompt += "\n\nTelegram group rules: be especially compact. In groups, answer only when addressed or clearly useful; ordinary replies should be 1-2 short paragraphs or bullets. Avoid structured labels unless the user asks for diagnostics or a plan. Do not emit raw Markdown that Telegram cannot render cleanly."
+    elif channel == "telegram":
+        system_prompt += "\n\nTelegram private-chat rules: answer in Russian unless asked otherwise; keep ordinary replies short, usually 1-4 sentences. Avoid **Observation:**, **Diagnosis:**, and other structured labels unless the user asks for analysis, a plan, or diagnostics. Do not emit raw Markdown that Telegram cannot render cleanly."
     system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
     now_utc, now_local = current_times()
     due_timers = materialize_due(client_id, conversation_id)
@@ -309,12 +314,13 @@ def complete_with_smart_memory(
     client_id: str,
     conversation_id: str,
     messages: list[dict[str, str]],
-) -> tuple[str, str, int, int, int]:
+) -> tuple[str, str, int, int, int, str | None]:
     raw_answer, model_mode = complete(messages)
     answer, directive = extract_memory_directive(raw_answer)
     saved = save_memory_items(client_id, directive.remember)
     timed_saved = save_timed_memory_items(client_id, conversation_id, directive.timers)
     recalled = 0
+    requested_persona = directive.persona
 
     if directive.recall:
         full_memories = storage.search_memory_cells(client_id, directive.recall, limit=5)
@@ -332,14 +338,17 @@ def complete_with_smart_memory(
             answer, second_directive = extract_memory_directive(raw_answer)
             saved += save_memory_items(client_id, second_directive.remember)
             timed_saved += save_timed_memory_items(client_id, conversation_id, second_directive.timers)
+            if second_directive.persona:
+                requested_persona = second_directive.persona
 
-    return answer, model_mode, saved, recalled, timed_saved
+    return answer, model_mode, saved, recalled, timed_saved, requested_persona
 
 
 def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     client_id = str(body.get("client_id") or DEFAULT_CLIENT_ID).strip()
     conversation_id = str(body.get("conversation_id") or DEFAULT_CONVERSATION_ID).strip()
     text = str(body.get("text") or "").strip()
+    channel = str(body.get("channel") or body.get("input_type") or "desktop").strip().lower()
 
     if not client_id:
         raise ValueError("client_id is required")
@@ -371,12 +380,15 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     if memory_response is not None:
         return memory_response
 
-    messages = build_messages_for_model(client_id, conversation_id, text, active_persona)
+    messages = build_messages_for_model(client_id, conversation_id, text, active_persona, channel=channel)
 
     storage.add_message(conversation_id, "user", text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
-    answer, model_mode, saved, recalled, timed_saved = complete_with_smart_memory(client_id, conversation_id, messages)
+    answer, model_mode, saved, recalled, timed_saved, requested_persona = complete_with_smart_memory(client_id, conversation_id, messages)
+    if requested_persona in {"ANA", "ALIEN"}:
+        active_persona = Persona(requested_persona)
+        storage.set_persona(client_id, conversation_id, active_persona)
     storage.add_message(conversation_id, "assistant", answer)
 
     return response_payload(
@@ -460,6 +472,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "client_id": linked_client_id,
         "conversation_id": conversation_id,
         "text": user_text,
+        "channel": "telegram_group" if chat_type != "private" else "telegram",
     })
     send_telegram_message(chat_id, str(payload.get("text") or ""))
     return {"ok": True, "handled": "message", "authorized": is_authorized}
@@ -503,11 +516,11 @@ def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: 
     )
 
 
-def send_telegram_message(chat_id: object, text: str) -> None:
+def send_telegram_message(chat_id: object, text: str, persona: str = "") -> None:
     if not TG_BOT_API_KEY:
         return
-    clean_text = text.strip() or "..."
-    payload = json.dumps({"chat_id": chat_id, "text": clean_text[:3800]}, ensure_ascii=False).encode("utf-8")
+    clean_text = telegram_message_html(text, persona) or "..."
+    payload = json.dumps({"chat_id": chat_id, "text": clean_text[:3800], "parse_mode": "HTML"}, ensure_ascii=False).encode("utf-8")
     request = Request(
         f"https://api.telegram.org/bot{TG_BOT_API_KEY}/sendMessage",
         data=payload,
@@ -517,6 +530,31 @@ def send_telegram_message(chat_id: object, text: str) -> None:
     with urlopen(request, timeout=30) as response:
         response.read()
 
+
+
+def telegram_message_html(text: str, persona: str = "") -> str:
+    blocks = parse_render_blocks(persona if persona in {"ANA", "ALIEN"} else "ANA", text)
+    if blocks:
+        lines: list[str] = []
+        for block in blocks:
+            label = str(block.get("label") or "").strip()
+            content = strip_basic_markdown(str(block.get("text") or "").strip())
+            if label and content:
+                lines.append(f"<b>{html.escape(label)}</b>\n{html.escape(content)}")
+            elif content:
+                lines.append(html.escape(content))
+        if lines:
+            return "\n\n".join(lines).strip()
+    return html.escape(strip_basic_markdown(text).strip())
+
+
+def strip_basic_markdown(text: str) -> str:
+    cleaned = re.sub(r"```(?:\w+)?\s*(.*?)\s*```", r"\1", text, flags=re.DOTALL)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-*]\s+", "- ", cleaned)
+    return cleaned.strip()
 
 def migrate_guest_memories(guest_client_id: str, app_client_id: str) -> int:
     if not guest_client_id or not app_client_id or guest_client_id == app_client_id:
@@ -748,3 +786,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

@@ -47,6 +47,19 @@ setting a reminder is clearly useful, append this private block:
 Use absolute ISO-8601 due_at values. If the user gives relative time, calculate
 it from the Current server time shown in the system prompt. Keep summaries very
 short. Never use timers for secrets.
+
+Persona switching is also available as a private function. If the user asks you
+to change style/persona, or the conversation clearly calls for another active
+mode, append one of these blocks at the very end of your answer:
+```assistant_memory
+{"persona":"ANA"}
+```
+or:
+```assistant_memory
+{"persona":"ALIEN"}
+```
+Only switch when it helps or when the user asks. Mention the switch briefly in
+the visible answer; the server will persist it for the next turn.
 """.strip()
 
 SECRET_HINTS = (
@@ -68,15 +81,17 @@ class MemoryDirective:
     remember: list[dict[str, Any]]
     recall: list[str]
     timers: list[dict[str, Any]]
+    persona: str | None
 
 
 def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
     remember: list[dict[str, Any]] = []
     recall: list[str] = []
     timers: list[dict[str, Any]] = []
+    persona: str | None = None
 
     def consume(match: re.Match[str]) -> str:
-        nonlocal remember, recall
+        nonlocal remember, recall, persona
         try:
             payload = json.loads(match.group(1))
         except json.JSONDecodeError:
@@ -93,10 +108,13 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
             raw_timers = payload.get("timers", payload.get("schedule", []))
             if isinstance(raw_timers, list):
                 timers.extend(item for item in raw_timers if isinstance(item, dict))
+            raw_persona = str(payload.get("persona") or payload.get("mode") or "").strip().upper()
+            if raw_persona in {"ANA", "ALIEN"}:
+                persona = raw_persona
         return ""
 
     cleaned = MEMORY_BLOCK_RE.sub(consume, text).strip()
-    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers)
+    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona)
 
 
 def sanitize_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -219,3 +237,5 @@ def build_timed_memory_context(due_rows: list[dict[str, Any]], now_utc: str, now
         for row in due_rows[:8]:
             parts.append(f"- [{row.get('due_at')}] {row.get('full_content') or row.get('summary')}")
     return "\n".join(parts)
+
+
