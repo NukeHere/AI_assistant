@@ -13,7 +13,8 @@ def test_core_prompt_is_shared_between_personas() -> None:
     ana = build_system_prompt(Persona.ANA)
     alien = build_system_prompt(Persona.ALIEN)
 
-    assert "Priority order" in ana
-    assert "Priority order" in alien
-    assert "Active persona: ANA" in ana
-    assert "Active persona: ALIEN" in alien
+    assert "Порядок приоритетов" in ana
+    assert "Порядок приоритетов" in alien
+    assert "Активная личность: ANA" in ana
+    assert "Активная личность: ALIEN" in alien
+

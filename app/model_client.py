@@ -37,7 +37,7 @@ class ModelClient:
                 user_text = message["content"]
                 break
 
-        if "Active persona: ALIEN" in system:
+        if "Активная личность: ALIEN" in system:
             return (
                 "Окно приняло песню. "
                 f"Тестовый ответ без внешней модели: {user_text[:180]}"
@@ -46,3 +46,4 @@ class ModelClient:
             "Запрос принят. "
             f"Тестовый ответ без внешней модели: {user_text[:180]}"
         )
+

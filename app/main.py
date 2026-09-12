@@ -95,7 +95,7 @@ async def message(request: MessageRequest) -> MessageResponse:
     alien_glossary = storage.alien_glossary(request.conversation_id)
     system_prompt = build_system_prompt(active_persona, alien_glossary)
     if memories:
-        system_prompt += "\n\nRelevant long-term memory:\n" + "\n".join(f"- {item}" for item in memories)
+        system_prompt += "\n\nРелевантная долгосрочная память:\n" + "\n".join(f"- {item}" for item in memories)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(storage.recent_messages(request.conversation_id))
@@ -146,3 +146,4 @@ async def run_backup() -> BackupResponse:
         storage.init()
     path = backup_service.run_once()
     return BackupResponse(ok=True, path=str(path), kept=backup_service.kept_count())
+

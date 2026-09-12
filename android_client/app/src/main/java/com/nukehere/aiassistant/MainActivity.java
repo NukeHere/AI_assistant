@@ -61,7 +61,7 @@ public class MainActivity extends Activity {
     private static final String TIMER_CHANNEL_ID = "timed_memory";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4301;
     private static final Pattern STRUCTURED_LINE = Pattern.compile(
-            "^\\s*(?:[-*]\\s*)?(?:\\*\\*)?(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)(?:\\*\\*)?\\s*:\\s*(.*)$",
+            "^\\s*(?:[-*]\\s*)?(?:\\*\\*)?(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion|Наблюдение|Диагностика|Рекомендуемое действие|Командное действие|Действие|Объяснение|Итог|Вывод)(?:\\*\\*)?\\s*:\\s*(.*)$",
             Pattern.CASE_INSENSITIVE
     );
 
@@ -561,12 +561,12 @@ public class MainActivity extends Activity {
     private String labelFor(String author, String label) {
         String key = label.toLowerCase(Locale.ROOT);
         boolean alien = author.equals("ALIEN");
-        if (key.equals("observation")) return alien ? "СИГНАЛ" : "НАБЛЮДЕНИЕ";
-        if (key.equals("diagnostic") || key.equals("diagnosis")) return alien ? "ДИССОНАНС" : "ДИАГНОСТИКА";
-        if (key.equals("recommended action") || key.equals("action")) return alien ? "НОТА ДЕЙСТВИЯ" : "ДЕЙСТВИЕ";
-        if (key.equals("command action")) return alien ? "КОМАНДНАЯ НОТА" : "КОМАНДА";
-        if (key.equals("explanation")) return alien ? "ГЛУБИНА" : "ОБЪЯСНЕНИЕ";
-        if (key.equals("conclusion")) return alien ? "РЕЗОНАНС" : "ВЫВОД";
+        if (key.equals("observation") || key.equals("наблюдение")) return alien ? "СИГНАЛ" : "НАБЛЮДЕНИЕ";
+        if (key.equals("diagnostic") || key.equals("diagnosis") || key.equals("диагностика")) return alien ? "ДИССОНАНС" : "ДИАГНОСТИКА";
+        if (key.equals("recommended action") || key.equals("action") || key.equals("рекомендуемое действие") || key.equals("действие")) return alien ? "НОТА ДЕЙСТВИЯ" : "ДЕЙСТВИЕ";
+        if (key.equals("command action") || key.equals("командное действие")) return alien ? "КОМАНДНАЯ НОТА" : "КОМАНДА";
+        if (key.equals("explanation") || key.equals("объяснение")) return alien ? "ГЛУБИНА" : "ОБЪЯСНЕНИЕ";
+        if (key.equals("conclusion") || key.equals("итог") || key.equals("вывод")) return alien ? "РЕЗОНАНС" : "ВЫВОД";
         return label.toUpperCase(Locale.ROOT);
     }
 
@@ -618,3 +618,4 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 }
+

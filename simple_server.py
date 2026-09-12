@@ -254,14 +254,23 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
     return None
 
 
-def build_messages_for_model(client_id: str, conversation_id: str, text: str, persona: Persona, channel: str = "desktop") -> list[dict[str, str]]:
+def build_messages_for_model(
+    client_id: str,
+    conversation_id: str,
+    text: str,
+    persona: Persona,
+    channel: str = "desktop",
+    channel_context: str = "",
+) -> list[dict[str, str]]:
     alien_glossary = storage.alien_glossary(conversation_id)
     system_prompt = build_system_prompt(persona, alien_glossary)
     system_prompt += "\n\n" + CAPABILITIES_PROMPT
     if channel == "telegram_group":
-        system_prompt += "\n\nTelegram group rules: be especially compact. In groups, answer only when addressed or clearly useful; ordinary replies should be 1-2 short paragraphs or bullets. Avoid structured labels unless the user asks for diagnostics or a plan. Do not emit raw Markdown that Telegram cannot render cleanly."
+        system_prompt += "\n\nПравила Telegram-группы: отвечай на русском и особенно компактно. В группе отвечай только когда к тебе обращаются или ответ явно полезен; обычная реплика — 1-2 коротких абзаца или пункта. Избегай структурных секций, если пользователь не просит диагностику или план. Не выводи сырой Markdown, который Telegram плохо отображает."
     elif channel == "telegram":
-        system_prompt += "\n\nTelegram private-chat rules: answer in Russian unless asked otherwise; keep ordinary replies short, usually 1-4 sentences. Avoid **Observation:**, **Diagnosis:**, and other structured labels unless the user asks for analysis, a plan, or diagnostics. Do not emit raw Markdown that Telegram cannot render cleanly."
+        system_prompt += "\n\nПравила личного Telegram-чата: отвечай на русском, если пользователь не попросил иначе; обычные ответы держи короткими, обычно 1-4 предложения. Избегай секций **Наблюдение:**, **Диагностика:** и других структурных меток, если пользователь не просит анализ, план или диагностику. Не выводи сырой Markdown, который Telegram плохо отображает."
+    if channel_context:
+        system_prompt += "\n\nКонтекст текущего канала:\n" + channel_context
     system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
     now_utc, now_local = current_times()
     due_timers = materialize_due(client_id, conversation_id)
@@ -314,13 +323,14 @@ def complete_with_smart_memory(
     client_id: str,
     conversation_id: str,
     messages: list[dict[str, str]],
-) -> tuple[str, str, int, int, int, str | None]:
+) -> tuple[str, str, int, int, int, str | None, dict[str, object] | None]:
     raw_answer, model_mode = complete(messages)
     answer, directive = extract_memory_directive(raw_answer)
     saved = save_memory_items(client_id, directive.remember)
     timed_saved = save_timed_memory_items(client_id, conversation_id, directive.timers)
     recalled = 0
     requested_persona = directive.persona
+    telegram_action = sanitize_telegram_action(directive.telegram_action)
 
     if directive.recall:
         full_memories = storage.search_memory_cells(client_id, directive.recall, limit=5)
@@ -328,10 +338,10 @@ def complete_with_smart_memory(
         if full_memories:
             recall_context = build_memory_context([], full_memories)
             recall_messages = messages + [
-                {"role": "assistant", "content": answer or "Memory recall requested."},
+                {"role": "assistant", "content": answer or "Запрошен доступ к памяти."},
                 {
                     "role": "system",
-                    "content": recall_context + "\n\nAnswer the user's last message using the recalled memory. You may save new memory if needed.",
+                    "content": recall_context + "\n\nОтветь на последнее сообщение пользователя, используя найденную полную память. Если нужно, можешь сохранить новую память.",
                 },
             ]
             raw_answer, model_mode = complete(recall_messages)
@@ -340,8 +350,11 @@ def complete_with_smart_memory(
             timed_saved += save_timed_memory_items(client_id, conversation_id, second_directive.timers)
             if second_directive.persona:
                 requested_persona = second_directive.persona
+            second_telegram_action = sanitize_telegram_action(second_directive.telegram_action)
+            if second_telegram_action:
+                telegram_action = second_telegram_action
 
-    return answer, model_mode, saved, recalled, timed_saved, requested_persona
+    return answer, model_mode, saved, recalled, timed_saved, requested_persona, telegram_action
 
 
 def handle_message_request(body: dict[str, object]) -> dict[str, object]:
@@ -349,6 +362,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     conversation_id = str(body.get("conversation_id") or DEFAULT_CONVERSATION_ID).strip()
     text = str(body.get("text") or "").strip()
     channel = str(body.get("channel") or body.get("input_type") or "desktop").strip().lower()
+    channel_context = str(body.get("channel_context") or "").strip()
 
     if not client_id:
         raise ValueError("client_id is required")
@@ -380,12 +394,12 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     if memory_response is not None:
         return memory_response
 
-    messages = build_messages_for_model(client_id, conversation_id, text, active_persona, channel=channel)
+    messages = build_messages_for_model(client_id, conversation_id, text, active_persona, channel=channel, channel_context=channel_context)
 
     storage.add_message(conversation_id, "user", text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
-    answer, model_mode, saved, recalled, timed_saved, requested_persona = complete_with_smart_memory(client_id, conversation_id, messages)
+    answer, model_mode, saved, recalled, timed_saved, requested_persona, telegram_action = complete_with_smart_memory(client_id, conversation_id, messages)
     if requested_persona in {"ANA", "ALIEN"}:
         active_persona = Persona(requested_persona)
         storage.set_persona(client_id, conversation_id, active_persona)
@@ -401,6 +415,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         memory_recalled=recalled,
         timed_memory_saved=timed_saved,
         model_mode=model_mode,
+        telegram_action=telegram_action,
     )
 
 
@@ -473,9 +488,10 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "conversation_id": conversation_id,
         "text": user_text,
         "channel": "telegram_group" if chat_type != "private" else "telegram",
+        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized),
     })
-    send_telegram_message(chat_id, str(payload.get("text") or ""))
-    return {"ok": True, "handled": "message", "authorized": is_authorized}
+    route_result = route_telegram_response(chat_id, telegram_user_id, user, chat_type, payload)
+    return {"ok": True, "handled": "message", "authorized": is_authorized, **route_result}
 
 
 def normalize_telegram_command(text: str) -> str:
@@ -504,6 +520,92 @@ def is_telegram_mention(text: str) -> bool:
         return True
     return any(word in lowered for word in ["ана", "alien", "алиен", "бот"] )
 
+
+def sanitize_telegram_action(action: object) -> dict[str, object] | None:
+    if not isinstance(action, dict):
+        return None
+    reply_to = str(action.get("reply_to") or action.get("target") or "group").strip().lower()
+    if reply_to not in {"group", "private", "both"}:
+        reply_to = "group"
+    group_text = str(action.get("group_text") or "").strip()
+    private_text = str(action.get("private_text") or "").strip()
+    return {
+        "reply_to": reply_to,
+        "mention_sender": bool(action.get("mention_sender") or action.get("mention_user")),
+        "group_text": group_text[:2000],
+        "private_text": private_text[:3800],
+    }
+
+
+def telegram_channel_context(user: dict[str, object], chat: dict[str, object], chat_type: str, is_authorized: bool) -> str:
+    username = str(user.get("username") or "").strip()
+    first_name = str(user.get("first_name") or "").strip()
+    last_name = str(user.get("last_name") or "").strip()
+    display_name = " ".join(part for part in [first_name, last_name] if part).strip() or username or "unknown"
+    mention = f"@{username}" if username else display_name
+    chat_title = str(chat.get("title") or chat.get("username") or "").strip()
+    scope = "личный чат" if chat_type == "private" else "групповой чат"
+    auth = "авторизованный пользователь приложения" if is_authorized else "гостевой пользователь Telegram"
+    lines = [
+        f"Telegram-область: {scope}.",
+        f"Отправитель: {display_name}; упоминание username: {mention}; статус: {auth}.",
+    ]
+    if chat_title:
+        lines.append(f"Название чата: {chat_title}.")
+    if chat_type != "private":
+        lines.append(
+            "В этой группе можно приватно запросить assistant_memory telegram_action: "
+            "reply_to=group для компактного публичного ответа, reply_to=private для конфиденциальных/персональных данных, "
+            "reply_to=both для короткой групповой реплики и более полного личного сообщения. "
+            "Используй mention_sender=true, когда обращаешься к отправителю в группе."
+        )
+    return "\n".join(lines)
+
+
+def telegram_sender_mention_text(user: dict[str, object]) -> str:
+    username = str(user.get("username") or "").strip()
+    if username:
+        return f"@{username}"
+    name = " ".join(str(user.get(part) or "").strip() for part in ["first_name", "last_name"]).strip()
+    return name or "пользователь"
+
+
+def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[str, object], chat_type: str, payload: dict[str, object]) -> dict[str, object]:
+    answer = str(payload.get("text") or "")
+    action = sanitize_telegram_action(payload.get("telegram_action")) or {"reply_to": "group", "mention_sender": False, "group_text": "", "private_text": ""}
+    if chat_type == "private":
+        send_telegram_message(chat_id, str(action.get("private_text") or answer))
+        return {"telegram_route": "private"}
+
+    reply_to = str(action.get("reply_to") or "group")
+    group_text = str(action.get("group_text") or "").strip()
+    private_text = str(action.get("private_text") or "").strip() or answer
+    if reply_to in {"group", "both"} and not group_text:
+        group_text = answer
+    if group_text and bool(action.get("mention_sender")):
+        mention = telegram_sender_mention_text(user)
+        if mention not in group_text:
+            group_text = f"{mention}, {group_text}"
+
+    sent_group = False
+    sent_private = False
+    if reply_to in {"group", "both"} and group_text:
+        send_telegram_message(chat_id, group_text)
+        sent_group = True
+    if reply_to in {"private", "both"} and private_text:
+        sent_private = try_send_telegram_message(telegram_user_id, private_text)
+        if not sent_private and not sent_group:
+            send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Напиши мне /start в личном чате и повтори запрос.")
+            sent_group = True
+    return {"telegram_route": reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private}
+
+
+def try_send_telegram_message(chat_id: object, text: str) -> bool:
+    try:
+        send_telegram_message(chat_id, text)
+    except (HTTPError, URLError, TimeoutError, OSError, RuntimeError):
+        return False
+    return True
 
 def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: bool) -> str:
     username = user.get("username") or user.get("first_name") or "гость"
@@ -641,9 +743,9 @@ def mock_response(messages: list[dict[str, str]]) -> str:
         if message.get("role") == "user":
             last_user_text = message.get("content", "")
             break
-    if "Active persona: ALIEN" in system:
-        return f"**Observation:** Окно приняло ноту.\n**Explanation:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
-    return f"**Observation:** Запрос принят.\n**Recommended action:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
+    if "Активная личность: ALIEN" in system:
+        return f"**Наблюдение:** Окно приняло ноту.\n**Объяснение:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
+    return f"**Наблюдение:** Запрос принят.\n**Рекомендуемое действие:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
 
 
 def valid_messages(value: object) -> bool:
@@ -786,6 +888,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
 
 
 

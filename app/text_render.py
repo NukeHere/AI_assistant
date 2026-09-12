@@ -4,31 +4,47 @@ import re
 
 STRUCTURED_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?"
-    r"(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion)"
+    r"(Observation|Diagnostic|Diagnosis|Recommended action|Command action|Action|Explanation|Conclusion|Наблюдение|Диагностика|Рекомендуемое действие|Командное действие|Действие|Объяснение|Итог|Вывод)"
     r"(?:\*\*)?\s*:\s*(.*)$",
     re.IGNORECASE,
 )
 
 ANA_BLOCK_LABELS = {
     "observation": "НАБЛЮДЕНИЕ",
+    "наблюдение": "НАБЛЮДЕНИЕ",
     "diagnostic": "ДИАГНОСТИКА",
     "diagnosis": "ДИАГНОСТИКА",
+    "диагностика": "ДИАГНОСТИКА",
     "recommended action": "ДЕЙСТВИЕ",
+    "рекомендуемое действие": "ДЕЙСТВИЕ",
     "command action": "КОМАНДА",
+    "командное действие": "КОМАНДА",
     "action": "ДЕЙСТВИЕ",
+    "действие": "ДЕЙСТВИЕ",
     "explanation": "ОБЪЯСНЕНИЕ",
+    "объяснение": "ОБЪЯСНЕНИЕ",
     "conclusion": "ВЫВОД",
+    "итог": "ВЫВОД",
+    "вывод": "ВЫВОД",
 }
 
 ALIEN_BLOCK_LABELS = {
     "observation": "СИГНАЛ",
+    "наблюдение": "СИГНАЛ",
     "diagnostic": "ДИССОНАНС",
     "diagnosis": "ДИССОНАНС",
+    "диагностика": "ДИССОНАНС",
     "recommended action": "НОТА ДЕЙСТВИЯ",
+    "рекомендуемое действие": "НОТА ДЕЙСТВИЯ",
     "command action": "КОМАНДНАЯ НОТА",
+    "командное действие": "КОМАНДНАЯ НОТА",
     "action": "НОТА ДЕЙСТВИЯ",
+    "действие": "НОТА ДЕЙСТВИЯ",
     "explanation": "ГЛУБИНА",
+    "объяснение": "ГЛУБИНА",
     "conclusion": "РЕЗОНАНС",
+    "итог": "РЕЗОНАНС",
+    "вывод": "РЕЗОНАНС",
 }
 
 INLINE_MARKDOWN_PATTERNS = [
@@ -65,3 +81,4 @@ def structured_parts(author: str, line: str) -> tuple[str, str] | None:
     label_key = match.group(1).lower()
     rest = strip_inline_markdown(match.group(2).strip())
     return persona_labels(author).get(label_key, label_key.upper()), rest
+

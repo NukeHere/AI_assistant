@@ -102,7 +102,7 @@ class SimpleServerTests(unittest.TestCase):
         self.assertIn("/alien", response["text"])
         self.assertIn("/memory", response["text"])
         self.assertIn("Умная память", response["text"])
-        self.assertIn("Conclusion", response["text"])
+        self.assertIn("Итог", response["text"])
 
     def test_model_system_prompt_contains_available_functions(self) -> None:
         with isolated_storage():
@@ -114,10 +114,10 @@ class SimpleServerTests(unittest.TestCase):
             )
 
         system_prompt = messages[0]["content"]
-        self.assertIn("Available assistant functions and boundaries", system_prompt)
+        self.assertIn("Доступные функции ассистента", system_prompt)
         self.assertIn("/functions", system_prompt)
         self.assertIn("assistant_memory recall", system_prompt)
-        self.assertIn("Current limits", system_prompt)
+        self.assertIn("Текущие ограничения", system_prompt)
         self.assertIn(CAPABILITIES_PROMPT, system_prompt)
 
     def test_model_memory_directive_is_saved_and_hidden(self) -> None:
@@ -167,7 +167,7 @@ class SimpleServerTests(unittest.TestCase):
                     "mock",
                 )
             joined = "\n".join(message["content"] for message in messages)
-            assert "Recalled full memory cells" in joined
+            assert "Найденные полные ячейки памяти" in joined
             return "Полная память использована.", "mock"
 
         with isolated_storage():
@@ -345,8 +345,90 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(response["authorized"])
         self.assertGreaterEqual(len(sent), 2)
 
+
+    def test_memory_directive_parser_extracts_telegram_action(self) -> None:
+        cleaned, directive = extract_memory_directive(
+            'Ок.\n```assistant_memory\n{"telegram_action":{"reply_to":"private","mention_sender":true,"private_text":"Отвечу в личке."}}\n```'
+        )
+
+        self.assertEqual(cleaned, "Ок.")
+        self.assertIsNotNone(directive.telegram_action)
+        self.assertEqual(directive.telegram_action["reply_to"], "private")
+        self.assertTrue(directive.telegram_action["mention_sender"])
+
+    def test_telegram_action_can_move_group_answer_to_private(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Сейчас отвечу лично.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"private","private_text":"Это конфиденциальный ответ."}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("бот, покажи конфиденциальное", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["handled"], "message")
+        self.assertEqual(response["telegram_route"], "private")
+        self.assertTrue(response["telegram_private_sent"])
+        self.assertEqual(sent[-1][0], "777")
+        self.assertIn("конфиденциальный", sent[-1][1])
+
+    def test_telegram_action_mentions_sender_in_group(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Смотри шутку про тему.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"group","mention_sender":true}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("бот, оцени анекдот", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "group")
+        self.assertTrue(response["telegram_group_sent"])
+        self.assertEqual(sent[-1][0], 555)
+        self.assertIn("@telegram_user", sent[-1][1])
+
     def test_telegram_message_html_removes_raw_markdown(self) -> None:
-        rendered = simple_server.telegram_message_html("**Observation:** Всё нормально\n**Conclusion:** Готово")
+        rendered = simple_server.telegram_message_html("**Наблюдение:** Всё нормально\n**Итог:** Готово")
 
         self.assertIn("<b>", rendered)
         self.assertIn("Готово", rendered)
@@ -370,11 +452,11 @@ class SimpleServerTests(unittest.TestCase):
         ana = build_system_prompt(Persona.ANA)
         alien = build_system_prompt(Persona.ALIEN)
 
-        self.assertIn("does not use ALIEN metaphors", ana)
-        self.assertIn("window", alien)
-        self.assertIn("Priority order", alien)
-        self.assertIn("user-facing Markdown cues", ana)
-        self.assertIn("Command action", alien)
+        self.assertIn("ANA не использует метафоры ALIEN", ana)
+        self.assertIn("окно", alien)
+        self.assertIn("Порядок приоритетов", alien)
+        self.assertIn("видимые Markdown-секции", ana)
+        self.assertIn("Командное действие", alien)
         self.assertNotIn("Default answer shape", ana)
         self.assertNotIn("Default answer shape", alien)
 
@@ -430,4 +512,5 @@ class isolated_storage:
 
 if __name__ == "__main__":
     unittest.main()
+
 

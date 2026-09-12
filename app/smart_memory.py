@@ -10,56 +10,49 @@ MEMORY_BLOCK_RE = re.compile(r"```assistant_memory\s*(\{.*?\})\s*```", re.IGNORE
 TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9_]{3,}")
 
 MEMORY_DIRECTIVE_PROMPT = """
-Smart memory functions are available through a private control block.
-Use them only when useful. The user should not see this block; the server will
-consume it.
+Функции умной памяти доступны через приватный управляющий блок.
+Используй их только когда это полезно. Пользователь не должен видеть этот блок: сервер его вырежет и обработает.
 
-To save important or thematic information, append this exact fenced JSON block at
-the very end of your answer:
+Чтобы сохранить важную или тематическую информацию, добавь в самый конец ответа такой fenced JSON-блок:
 ```assistant_memory
-{"remember":[{"kind":"important|thematic","summary":"very short memory cue","full":"complete extracted information","topics":["topic"],"importance":1-5}]}
+{"remember":[{"kind":"important|thematic","summary":"очень короткая подсказка памяти","full":"полная извлечённая информация","topics":["тема"],"importance":1-5}]}
 ```
 
-Use kind="important" for durable facts that should almost always be remembered:
-identity, stable preferences, long-term projects, recurring constraints,
-important people, access rules, and major decisions. Use kind="thematic" for
-facts useful only in a topic area.
+Используй kind="important" для устойчивых фактов, которые почти всегда стоит помнить: личность, стабильные предпочтения, долгосрочные проекты, повторяющиеся ограничения, важные люди, правила доступа и ключевые решения.
+Используй kind="thematic" для фактов, полезных только внутри определённой темы.
 
-The summary must be compact enough to include in future prompts. The full field
-must contain the complete extracted information so it can be recalled later.
-Never store passwords, API keys, private tokens, or raw secrets.
+Поле summary должно быть настолько коротким, чтобы его можно было дёшево добавлять в будущие промпты.
+Поле full должно содержать полную извлечённую информацию, чтобы её можно было позже запросить целиком.
+Никогда не сохраняй пароли, API-ключи, приватные токены или сырые секреты.
 
-When short memory cues indicate that full memory is needed for the current
-answer, request recall at the end instead of guessing:
+Если краткие подсказки памяти показывают, что для текущего ответа нужна полная память, запроси recall в конце ответа вместо угадывания:
 ```assistant_memory
-{"recall":["topic or summary to search"]}
+{"recall":["тема или summary для поиска"]}
 ```
 
-If you request recall, give a useful preliminary answer if possible. The server
-may run a second pass with the recalled full memory.
+Если запрашиваешь recall, по возможности дай полезный предварительный ответ. Сервер может выполнить второй проход с полной найденной памятью.
 
-Timed memory is available for future reminders. If the user asks to remember,
-notify, wake up, or bring something back at a specific future date/time, or if
-setting a reminder is clearly useful, append this private block:
+Временная память доступна для будущих напоминаний. Если пользователь просит запомнить, уведомить, разбудить или вернуть информацию в конкретную будущую дату/время, либо если напоминание явно полезно, добавь приватный блок:
 ```assistant_memory
-{"timers":[{"summary":"very short reminder cue","full":"complete reminder content","due_at":"2030-04-17T12:34:56Z","timezone":"Europe/Moscow"}]}
+{"timers":[{"summary":"очень короткая подсказка напоминания","full":"полное содержимое напоминания","due_at":"2030-04-17T12:34:56Z","timezone":"Europe/Moscow"}]}
 ```
-Use absolute ISO-8601 due_at values. If the user gives relative time, calculate
-it from the Current server time shown in the system prompt. Keep summaries very
-short. Never use timers for secrets.
+Используй абсолютные ISO-8601 значения due_at. Если пользователь дал относительное время, рассчитай его от текущего серверного времени, показанного в системном промпте. Summary держи очень коротким. Не используй timers для секретов.
 
-Persona switching is also available as a private function. If the user asks you
-to change style/persona, or the conversation clearly calls for another active
-mode, append one of these blocks at the very end of your answer:
+Переключение личности тоже доступно как приватная функция. Если пользователь просит сменить стиль/личность или разговору явно нужен другой активный режим, добавь в самый конец ответа один из блоков:
 ```assistant_memory
 {"persona":"ANA"}
 ```
-or:
+или:
 ```assistant_memory
 {"persona":"ALIEN"}
 ```
-Only switch when it helps or when the user asks. Mention the switch briefly in
-the visible answer; the server will persist it for the next turn.
+Переключайся только когда это помогает или когда пользователь попросил. В видимом ответе кратко упомяни смену; сервер сохранит её для следующего сообщения.
+
+Telegram-маршрутизация доступна только в Telegram-каналах. Используй её, когда ответ в группе должен упомянуть отправителя, когда конфиденциальную информацию нужно перенести в личку, или когда нужен короткий ответ в группу плюс более полный ответ в личные сообщения:
+```assistant_memory
+{"telegram_action":{"reply_to":"group|private|both","mention_sender":true,"group_text":"необязательный короткий ответ в группу","private_text":"необязательный личный ответ"}}
+```
+Используй reply_to="private" для конфиденциальной или персональной информации. Используй mention_sender=true, когда групповой ответ должен явно обратиться к отправителю. Если private_text или group_text не указаны, сервер использует видимый ответ. Никогда не помещай секреты в telegram_action.
 """.strip()
 
 SECRET_HINTS = (
@@ -82,6 +75,7 @@ class MemoryDirective:
     recall: list[str]
     timers: list[dict[str, Any]]
     persona: str | None
+    telegram_action: dict[str, Any] | None
 
 
 def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
@@ -89,9 +83,10 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
     recall: list[str] = []
     timers: list[dict[str, Any]] = []
     persona: str | None = None
+    telegram_action: dict[str, Any] | None = None
 
     def consume(match: re.Match[str]) -> str:
-        nonlocal remember, recall, persona
+        nonlocal remember, recall, persona, telegram_action
         try:
             payload = json.loads(match.group(1))
         except json.JSONDecodeError:
@@ -111,10 +106,13 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
             raw_persona = str(payload.get("persona") or payload.get("mode") or "").strip().upper()
             if raw_persona in {"ANA", "ALIEN"}:
                 persona = raw_persona
+            raw_telegram = payload.get("telegram_action", payload.get("telegram"))
+            if isinstance(raw_telegram, dict):
+                telegram_action = raw_telegram
         return ""
 
     cleaned = MEMORY_BLOCK_RE.sub(consume, text).strip()
-    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona)
+    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona, telegram_action=telegram_action)
 
 
 def sanitize_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -159,12 +157,12 @@ def sanitize_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_memory_context(summary_rows: list[dict[str, Any]], full_rows: list[dict[str, Any]] | None = None) -> str:
     parts: list[str] = []
     if summary_rows:
-        parts.append("Available memory summaries:")
+        parts.append("Доступные краткие записи памяти:")
         for row in summary_rows:
-            label = "important" if int(row.get("importance", 1)) >= 4 or row.get("kind") == "important" else "thematic"
+            label = "важное" if int(row.get("importance", 1)) >= 4 or row.get("kind") == "important" else "тематическое"
             parts.append(f"- [{label}] {row['summary']}")
     if full_rows:
-        parts.append("Recalled full memory cells:")
+        parts.append("Найденные полные ячейки памяти:")
         for row in full_rows:
             parts.append(f"- {row['full_content']}")
     return "\n".join(parts)
@@ -230,12 +228,16 @@ def normalize_due_at(value: str) -> str:
 
 
 def build_timed_memory_context(due_rows: list[dict[str, Any]], now_utc: str, now_local: str) -> str:
-    parts = [f"Current server time: {now_utc} UTC; Europe/Moscow: {now_local}."]
-    parts.append("You may create timed memory reminders with private assistant_memory timers when useful.")
+    parts = [f"Текущее серверное время: {now_utc} UTC; Europe/Moscow: {now_local}."]
+    parts.append("Когда полезно, можешь создавать временные напоминания через приватные assistant_memory timers.")
     if due_rows:
-        parts.append("Due timed memories for this turn:")
+        parts.append("Наступившие временные напоминания для этого сообщения:")
         for row in due_rows[:8]:
             parts.append(f"- [{row.get('due_at')}] {row.get('full_content') or row.get('summary')}")
     return "\n".join(parts)
+
+
+
+
 
 
