@@ -231,6 +231,33 @@ class SimpleServerTests(unittest.TestCase):
         self.assertIn("синий", memories[0]["summary"])
         self.assertEqual(history[0]["content"], "Привет")
 
+
+    def test_snapshot_roundtrip_keeps_telegram_link(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            first = Storage(Path(temp_dir) / "first.sqlite3")
+            first.init()
+            first.upsert_telegram_user(
+                telegram_user_id="777",
+                username="telegram_user",
+                first_name="Telegram",
+                last_name="User",
+                is_bot=False,
+            )
+            first.link_telegram_user("777", "primary-user")
+            snapshot = first.export_client_snapshot("primary-user")
+
+            second = Storage(Path(temp_dir) / "second.sqlite3")
+            second.init()
+            imported = second.import_client_snapshot("primary-user", snapshot)
+            linked_client_id, is_authorized = second.telegram_client_context("777")
+            user = second.get_telegram_user("777")
+
+        self.assertEqual(imported["telegram_users"], 1)
+        self.assertEqual(linked_client_id, "primary-user")
+        self.assertTrue(is_authorized)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["username"], "telegram_user")
+
     def test_snapshot_endpoint_exports_and_imports_client_state(self) -> None:
         with isolated_storage():
             handle_message_request(
@@ -512,5 +539,6 @@ class isolated_storage:
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

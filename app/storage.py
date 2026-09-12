@@ -560,6 +560,19 @@ class Storage:
                     (client_id,),
                 ).fetchall()
             ]
+            telegram_users = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    select telegram_user_id, app_client_id, guest_client_id, username, first_name,
+                           last_name, is_bot, is_authorized, created_at, updated_at
+                      from telegram_users
+                     where app_client_id = ? or guest_client_id = ?
+                     order by updated_at, telegram_user_id
+                    """,
+                    (client_id, client_id),
+                ).fetchall()
+            ]
         return {
             "format": "ai-assistant-snapshot-v1",
             "client_id": client_id,
@@ -568,6 +581,7 @@ class Storage:
             "memories": memories,
             "memory_cells": memory_cells,
             "timed_memories": timed_memories,
+            "telegram_users": telegram_users,
         }
 
     def import_client_snapshot(self, client_id: str, snapshot: dict[str, Any]) -> dict[str, int]:
@@ -581,10 +595,11 @@ class Storage:
         memories = snapshot.get("memories") or []
         memory_cells = snapshot.get("memory_cells") or []
         timed_memories = snapshot.get("timed_memories") or []
-        if not all(isinstance(items, list) for items in [conversations, messages, memories, memory_cells, timed_memories]):
+        telegram_users = snapshot.get("telegram_users") or []
+        if not all(isinstance(items, list) for items in [conversations, messages, memories, memory_cells, timed_memories, telegram_users]):
             raise ValueError("Snapshot sections must be arrays")
 
-        counts = {"conversations": 0, "messages": 0, "memories": 0, "memory_cells": 0, "timed_memories": 0}
+        counts = {"conversations": 0, "messages": 0, "memories": 0, "memory_cells": 0, "timed_memories": 0, "telegram_users": 0}
         with self._lock, self._connect() as conn:
             for item in conversations:
                 if not isinstance(item, dict) or not item.get("id"):
@@ -777,6 +792,47 @@ class Storage:
                     ),
                 )
                 counts["timed_memories"] += 1
+            for item in telegram_users:
+                if not isinstance(item, dict):
+                    continue
+                telegram_user_id = str(item.get("telegram_user_id") or "").strip()
+                guest_client_id = str(item.get("guest_client_id") or "").strip()
+                app_client_id = str(item.get("app_client_id") or "").strip()
+                if not telegram_user_id or not guest_client_id:
+                    continue
+                if app_client_id and app_client_id != client_id:
+                    continue
+                conn.execute(
+                    """
+                    insert into telegram_users
+                        (telegram_user_id, app_client_id, guest_client_id, username, first_name,
+                         last_name, is_bot, is_authorized, created_at, updated_at)
+                    values (?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, current_timestamp), coalesce(?, current_timestamp))
+                    on conflict(telegram_user_id) do update set
+                        app_client_id = excluded.app_client_id,
+                        guest_client_id = excluded.guest_client_id,
+                        username = excluded.username,
+                        first_name = excluded.first_name,
+                        last_name = excluded.last_name,
+                        is_bot = excluded.is_bot,
+                        is_authorized = excluded.is_authorized,
+                        updated_at = max(telegram_users.updated_at, excluded.updated_at)
+                    """,
+                    (
+                        telegram_user_id,
+                        app_client_id or None,
+                        guest_client_id,
+                        str(item.get("username") or "")[:128],
+                        str(item.get("first_name") or "")[:128],
+                        str(item.get("last_name") or "")[:128],
+                        1 if int(item.get("is_bot") or 0) else 0,
+                        1 if int(item.get("is_authorized") or 0) and app_client_id == client_id else 0,
+                        item.get("created_at"),
+                        item.get("updated_at"),
+                    ),
+                )
+                counts["telegram_users"] += 1
+
         return counts
 
     def sync_messages(
@@ -953,3 +1009,4 @@ class Storage:
             if len(deduped) >= limit:
                 break
         return deduped
+
