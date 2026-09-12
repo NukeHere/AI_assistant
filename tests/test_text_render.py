@@ -9,6 +9,10 @@ class TextRenderTests(unittest.TestCase):
         self.assertEqual(strip_inline_markdown("- **пункт**"), "• пункт")
         self.assertEqual(strip_inline_markdown("### Заголовок"), "Заголовок")
 
+    def test_strip_inline_markdown_keeps_telegram_usernames(self) -> None:
+        self.assertEqual(strip_inline_markdown("@Ne_gr_idi_rabotai привет"), "@Ne_gr_idi_rabotai привет")
+        self.assertEqual(strip_inline_markdown("@Ne\\_gr\\_idi\\_rabotai привет"), "@Ne_gr_idi_rabotai привет")
+        self.assertEqual(strip_inline_markdown("**@Ne_gr_idi_rabotai**, смотри"), "@Ne_gr_idi_rabotai, смотри")
     def test_structured_parts_maps_persona_labels_and_cleans_content(self) -> None:
         label, rest = structured_parts("ALIEN", "**Observation:** **Окно** открыто")
         self.assertEqual(label, "СИГНАЛ")

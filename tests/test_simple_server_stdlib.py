@@ -518,6 +518,11 @@ class SimpleServerTests(unittest.TestCase):
         self.assertIn("<b>", rendered)
         self.assertIn("Готово", rendered)
         self.assertNotIn("**", rendered)
+    def test_telegram_message_html_keeps_username_underscores(self) -> None:
+        rendered = simple_server.telegram_message_html("**@Ne_gr_idi_rabotai**, смотри сюда")
+
+        self.assertIn("@Ne_gr_idi_rabotai", rendered)
+        self.assertNotIn("@Negridi_rabotai", rendered)
     def test_alien_glossary_extracts_stable_terms(self) -> None:
         terms = extract_alien_glossary_terms("API сервера отдаёт ошибку")
 

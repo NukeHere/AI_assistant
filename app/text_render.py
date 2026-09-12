@@ -47,6 +47,8 @@ ALIEN_BLOCK_LABELS = {
     "вывод": "РЕЗОНАНС",
 }
 
+TELEGRAM_HANDLE_RE = re.compile(r"@(?:(?:[A-Za-z0-9_])|(?:\\_)){5,64}")
+
 INLINE_MARKDOWN_PATTERNS = [
     re.compile(r"\*\*([^*]+)\*\*"),
     re.compile(r"__([^_]+)__"),
@@ -61,7 +63,14 @@ def persona_labels(author: str) -> dict[str, str]:
 
 
 def strip_inline_markdown(text: str) -> str:
-    cleaned = text
+    protected_handles: dict[str, str] = {}
+
+    def protect_handle(match: re.Match[str]) -> str:
+        placeholder = f"§TGMENTION{len(protected_handles)}§"
+        protected_handles[placeholder] = match.group(0).replace("\\_", "_")
+        return placeholder
+
+    cleaned = TELEGRAM_HANDLE_RE.sub(protect_handle, text)
     cleaned = re.sub(r"^#{1,6}\s+", "", cleaned)
     cleaned = re.sub(r"^>\s?", "", cleaned)
     cleaned = re.sub(r"^\s*[-*+]\s+", "• ", cleaned)
@@ -71,6 +80,8 @@ def strip_inline_markdown(text: str) -> str:
     cleaned = cleaned.replace("```", "")
     cleaned = cleaned.replace("**", "").replace("__", "")
     cleaned = cleaned.strip(" *_")
+    for placeholder, handle in protected_handles.items():
+        cleaned = cleaned.replace(placeholder, handle)
     return cleaned
 
 
