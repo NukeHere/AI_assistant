@@ -950,7 +950,12 @@ class AssistantHandler(BaseHTTPRequestHandler):
             self.send_json({"error": str(error)}, status=422)
             return
         except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
-            self.send_json({"error": f"Model request failed: {error}"}, status=502)
+            audit_event("request_failed", path=self.path, error_type=type(error).__name__, error_preview=str(error))
+            self.send_json({"error": f"Model request failed: {error}", "error_type": type(error).__name__}, status=502)
+            return
+        except Exception as error:
+            audit_event("request_failed", path=self.path, error_type=type(error).__name__, error_preview=str(error))
+            self.send_json({"error": "Server request failed", "error_type": type(error).__name__, "detail": text_preview(str(error), 300)}, status=500)
             return
 
         self.send_json({"text": text, "model_mode": model_mode})
