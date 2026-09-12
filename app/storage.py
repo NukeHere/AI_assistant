@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -168,14 +169,15 @@ class Storage:
         client_created_at: str | None = None,
     ) -> dict[str, Any]:
         content_hash = self.message_hash(conversation_id, role, content)
+        if not message_uid:
+            message_uid = f"srv-{conversation_id}-{uuid.uuid4().hex}"
         with self._lock, self._connect() as conn:
-            if message_uid:
-                existing = conn.execute(
-                    "select * from messages where message_uid = ? limit 1",
-                    (message_uid,),
-                ).fetchone()
-                if existing is not None:
-                    return dict(existing)
+            existing = conn.execute(
+                "select * from messages where message_uid = ? limit 1",
+                (message_uid,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
             cursor = conn.execute(
                 """
                 insert into messages (conversation_id, role, content, message_uid, device_id, client_created_at, content_hash)
@@ -184,16 +186,12 @@ class Storage:
                 (conversation_id, role, content, message_uid, device_id, client_created_at, content_hash),
             )
             row_id = int(cursor.lastrowid)
-            if not message_uid:
-                message_uid = f"srv-{conversation_id}-{row_id}"
-                conn.execute("update messages set message_uid = ? where id = ?", (message_uid, row_id))
             conn.execute(
                 "update conversations set updated_at = current_timestamp where id = ?",
                 (conversation_id,),
             )
             row = conn.execute("select * from messages where id = ?", (row_id,)).fetchone()
         return dict(row)
-
     def upsert_message_event(self, client_id: str, event: dict[str, Any]) -> bool:
         conversation_id = str(event.get("conversation_id") or "default").strip()
         role = str(event.get("role") or "").strip()
