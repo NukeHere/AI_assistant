@@ -112,7 +112,7 @@ Telegram-бот подключается как дополнительный и�
 2. В Telegram напиши боту `/link <client_id>`.
 3. После привязки сообщения из Telegram идут в тот же `client_id` и синхронизируются с основными приложениями.
 
-На Render нужно задать `TG_BOT_API_KEY`; для защищённого webhook желательно также `TG_WEBHOOK_SECRET`.
+На Render нужно задать `TG_BOT_API_KEY`; для защищённого webhook желательно также `TG_WEBHOOK_SECRET`. Чтобы получать реакции, при настройке webhook включи `allowed_updates` со значениями `message`, `edited_message` и `message_reaction`.
 
 ## Голосовой режим
 

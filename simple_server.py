@@ -47,11 +47,15 @@ ASSISTANT_TIMEZONE = os.getenv("ASSISTANT_TIMEZONE", "Europe/Moscow")
 TG_BOT_API_KEY = os.getenv("TG_BOT_API_KEY", "")
 TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET", "")
 TG_BOT_USERNAME = os.getenv("TG_BOT_USERNAME", "VBDsThirdSon_bot").lstrip("@")
+TG_BOT_ID = os.getenv("TG_BOT_ID", "").strip()
+TG_GROUP_ACTIVE_SECONDS = int(os.getenv("TG_GROUP_ACTIVE_SECONDS", "1800"))
+TG_AUTHORIZED_SAMPLE_EVERY = max(0, int(os.getenv("TG_AUTHORIZED_SAMPLE_EVERY", "5")))
 TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_SECRETARY_MODE = os.getenv("TG_SECRETARY_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_BOT_TO_BOT = os.getenv("TG_BOT_TO_BOT", "true").lower() not in {"0", "false", "no", "off"}
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
+TELEGRAM_GROUP_STATE: dict[str, dict[str, object]] = {}
 
 storage = Storage(DATABASE_PATH)
 
@@ -81,7 +85,7 @@ def audit_event(event: str, **fields: object) -> None:
             log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
         pass
-    print("AUDIT " + json.dumps(record, ensure_ascii=False), flush=True)
+    print("AUDIT " + json.dumps(record, ensure_ascii=True), flush=True)
 
 def current_times() -> tuple[str, str]:
     now = datetime.now(timezone.utc)
@@ -471,6 +475,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if not TG_BOT_API_KEY:
         audit_event("telegram_ignored", reason="telegram_disabled")
         return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
+    reaction_update = body.get("message_reaction")
+    if isinstance(reaction_update, dict):
+        return handle_telegram_reaction_update(reaction_update)
     message = body.get("message") or body.get("edited_message")
     if not isinstance(message, dict):
         audit_event("telegram_ignored", reason="no_message")
@@ -494,6 +501,8 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "ignored": True, "reason": "bot_sender"}
 
     addressed = is_telegram_addressed(text)
+    reply_to_bot = is_reply_to_telegram_bot(message)
+    message_id = message.get("message_id")
     user = storage.upsert_telegram_user(
         telegram_user_id=telegram_user_id,
         username=username,
@@ -511,12 +520,32 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         username=username,
         authorized=is_authorized,
         addressed=addressed,
+        reply_to_bot=reply_to_bot,
         text_preview=text,
     )
 
-    if should_ignore_telegram_message(command_text, chat_type, is_authorized, addressed=addressed):
-        audit_event("telegram_ignored", reason="secretary_mode", chat_id=chat_id, chat_type=chat_type, telegram_user_id=telegram_user_id, authorized=is_authorized, addressed=addressed, text_preview=text)
-        return {"ok": True, "ignored": True, "reason": "secretary_mode"}
+    should_process, decision_reason, participation_mode = telegram_participation_decision(
+        command_text,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        is_authorized=is_authorized,
+        addressed=addressed,
+        reply_to_bot=reply_to_bot,
+    )
+    if not should_process:
+        audit_event(
+            "telegram_ignored",
+            reason=decision_reason,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            telegram_user_id=telegram_user_id,
+            authorized=is_authorized,
+            addressed=addressed,
+            reply_to_bot=reply_to_bot,
+            participation_mode=participation_mode,
+            text_preview=text,
+        )
+        return {"ok": True, "ignored": True, "reason": decision_reason, "participation_mode": participation_mode}
 
     if command_text.startswith("/start"):
         reply = telegram_start_text(user, linked_client_id, is_authorized)
@@ -566,9 +595,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "conversation_id": conversation_id,
         "text": user_text,
         "channel": "telegram_group" if chat_type != "private" else "telegram",
-        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized),
+        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode),
     })
-    route_result = route_telegram_response(chat_id, telegram_user_id, user, chat_type, payload)
+    route_result = route_telegram_response(chat_id, telegram_user_id, user, chat_type, payload, message_id=message_id)
     audit_event(
         "telegram_handled",
         chat_id=chat_id,
@@ -577,6 +606,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         username=username,
         authorized=is_authorized,
         addressed=addressed,
+        reply_to_bot=reply_to_bot,
+        participation_mode=participation_mode,
+        decision_reason=decision_reason,
         memory_saved=payload.get("memory_saved"),
         memory_recalled=payload.get("memory_recalled"),
         timed_memory_saved=payload.get("timed_memory_saved"),
@@ -584,7 +616,65 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         text_preview=text,
         response_preview=payload.get("text"),
     )
-    return {"ok": True, "handled": "message", "authorized": is_authorized, **route_result}
+    return {"ok": True, "handled": "message", "authorized": is_authorized, "participation_mode": participation_mode, "decision_reason": decision_reason, **route_result}
+
+def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[str, object]:
+    chat = reaction_update.get("chat") if isinstance(reaction_update.get("chat"), dict) else {}
+    user = reaction_update.get("user") if isinstance(reaction_update.get("user"), dict) else {}
+    chat_id = chat.get("id")
+    message_id = reaction_update.get("message_id")
+    telegram_user_id = str(user.get("id") or "").strip()
+    username = str(user.get("username") or "").strip()
+    new_reactions = reaction_update.get("new_reaction")
+    emoji_list = telegram_reaction_emojis(new_reactions)
+    if telegram_user_id:
+        storage.upsert_telegram_user(
+            telegram_user_id=telegram_user_id,
+            username=username,
+            first_name=str(user.get("first_name") or ""),
+            last_name=str(user.get("last_name") or ""),
+            is_bot=bool(user.get("is_bot")),
+        )
+    linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id) if telegram_user_id else (DEFAULT_CLIENT_ID, False)
+    remembered = False
+    if telegram_user_id and is_authorized and emoji_list:
+        summary = f"Telegram-реакция {' '.join(emoji_list)} на сообщение бота"
+        full = f"Пользователь Telegram @{username or telegram_user_id} поставил реакцию {' '.join(emoji_list)} на сообщение {message_id} в чате {chat_id}."
+        storage.add_memory_cell(
+            client_id=linked_client_id,
+            kind="thematic",
+            summary=summary[:240],
+            full_content=full,
+            topics=["telegram", "reaction"],
+            importance=1,
+        )
+        remembered = True
+    audit_event(
+        "telegram_reaction_received",
+        chat_id=chat_id,
+        message_id=message_id,
+        telegram_user_id=telegram_user_id,
+        username=username,
+        authorized=is_authorized,
+        reactions=" ".join(emoji_list),
+        remembered=remembered,
+    )
+    return {"ok": True, "handled": "reaction", "authorized": is_authorized, "remembered": remembered}
+
+
+def telegram_reaction_emojis(reactions: object) -> list[str]:
+    if not isinstance(reactions, list):
+        return []
+    emojis: list[str] = []
+    for reaction in reactions:
+        if not isinstance(reaction, dict):
+            continue
+        if reaction.get("type") == "emoji" and reaction.get("emoji"):
+            emojis.append(str(reaction.get("emoji")))
+        elif reaction.get("type") == "custom_emoji" and reaction.get("custom_emoji_id"):
+            emojis.append("custom_emoji:" + str(reaction.get("custom_emoji_id")))
+    return emojis
+
 def normalize_telegram_command(text: str) -> str:
     stripped = text.strip()
     if TG_BOT_USERNAME:
@@ -594,16 +684,103 @@ def normalize_telegram_command(text: str) -> str:
 
 
 def should_ignore_telegram_message(text: str, chat_type: str, is_authorized: bool, addressed: bool | None = None) -> bool:
-    if not TG_SECRETARY_MODE:
-        return False
-    if text.startswith("/"):
-        return False
-    if chat_type == "private":
-        return False
     was_addressed = is_telegram_addressed(text) if addressed is None else addressed
-    if was_addressed:
+    should_process, _, _ = telegram_participation_decision(
+        text,
+        chat_id="legacy",
+        chat_type=chat_type,
+        is_authorized=is_authorized,
+        addressed=was_addressed,
+        reply_to_bot=False,
+        update_state=False,
+    )
+    return not should_process
+
+
+def telegram_participation_decision(
+    text: str,
+    *,
+    chat_id: object,
+    chat_type: str,
+    is_authorized: bool,
+    addressed: bool,
+    reply_to_bot: bool,
+    update_state: bool = True,
+) -> tuple[bool, str, str]:
+    if not TG_SECRETARY_MODE:
+        return True, "secretary_disabled", "full"
+    if text.startswith("/"):
+        return True, "command", "command"
+    if chat_type == "private":
+        return True, "private_chat", "full"
+
+    state = telegram_group_state(chat_id)
+    if update_state:
+        state["seen_count"] = int(state.get("seen_count") or 0) + 1
+    if addressed:
+        mark_telegram_chat_active(chat_id, reason="addressed")
+        return True, "addressed", "active"
+    if reply_to_bot:
+        mark_telegram_chat_active(chat_id, reason="reply_to_bot")
+        return True, "reply_to_bot", "active"
+    if not is_authorized:
+        return False, "guest_group_chatter", "ignore"
+    if is_telegram_group_active(chat_id):
+        return True, "active_authorized_context", "active"
+    if is_telegram_relevant_for_assistant(text):
+        mark_telegram_chat_active(chat_id, reason="authorized_relevant")
+        return True, "authorized_relevant", "relevant"
+
+    sample_every = TG_AUTHORIZED_SAMPLE_EVERY
+    seen_count = int(state.get("seen_count") or 0)
+    if sample_every > 0 and seen_count > 0 and seen_count % sample_every == 0:
+        return True, "authorized_sampling", "sample"
+    return False, "authorized_group_not_relevant", "background"
+
+
+def telegram_group_state(chat_id: object) -> dict[str, object]:
+    key = str(chat_id)
+    state = TELEGRAM_GROUP_STATE.setdefault(key, {"seen_count": 0, "active_until": 0.0, "last_reason": ""})
+    return state
+
+
+def mark_telegram_chat_active(chat_id: object, *, reason: str) -> None:
+    state = telegram_group_state(chat_id)
+    state["active_until"] = datetime.now(timezone.utc).timestamp() + max(TG_GROUP_ACTIVE_SECONDS, 0)
+    state["last_reason"] = reason
+
+
+def is_telegram_group_active(chat_id: object) -> bool:
+    state = telegram_group_state(chat_id)
+    return float(state.get("active_until") or 0.0) > datetime.now(timezone.utc).timestamp()
+
+
+def is_reply_to_telegram_bot(message: dict[str, object]) -> bool:
+    reply = message.get("reply_to_message")
+    if not isinstance(reply, dict):
         return False
-    return True
+    reply_sender = reply.get("from")
+    if not isinstance(reply_sender, dict) or not bool(reply_sender.get("is_bot")):
+        return False
+    reply_username = str(reply_sender.get("username") or "").lstrip("@").lower()
+    known_usernames = {name.lower() for name in [TG_BOT_USERNAME, "VBDsThirdSon_bot"] if name}
+    if reply_username and reply_username in known_usernames:
+        return True
+    reply_id = str(reply_sender.get("id") or "").strip()
+    return bool(TG_BOT_ID and reply_id == TG_BOT_ID)
+
+
+def is_telegram_relevant_for_assistant(text: str) -> bool:
+    lowered = text.lower()
+    if "?" in lowered or "？" in lowered:
+        return True
+    phrases = [
+        "как", "что", "почему", "зачем", "когда", "где", "можешь", "сможешь", "помоги",
+        "сделай", "проверь", "объясни", "скажи", "напомни", "запомни", "память",
+        "ошибка", "не работает", "сломалось", "баг", "секретарь", "ассистент", "ана", "анна",
+        "anna", "alien", "бот", "bot",
+    ]
+    return any(re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", lowered, flags=re.IGNORECASE) for phrase in phrases)
 
 
 def is_telegram_addressed(text: str) -> bool:
@@ -616,6 +793,8 @@ def is_telegram_addressed(text: str) -> bool:
         r"(?<!\w)бот(?:ик)?(?!\w)",
         r"(?<!\w)секретарь(?!\w)",
         r"(?<!\w)ана(?!\w)",
+        r"(?<!\w)анна(?!\w)",
+        r"(?<!\w)anna(?!\w)",
         r"(?<!\w)алиен(?!\w)",
         r"(?<!\w)alien(?!\w)",
         r"(?<!\w)bot(?!\w)",
@@ -633,15 +812,17 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
         reply_to = "group"
     group_text = str(action.get("group_text") or "").strip()
     private_text = str(action.get("private_text") or "").strip()
+    reaction_emoji = str(action.get("reaction_emoji") or action.get("emoji") or "").strip()
     return {
         "reply_to": reply_to,
         "mention_sender": bool(action.get("mention_sender") or action.get("mention_user")),
         "group_text": group_text[:2000],
         "private_text": private_text[:3800],
+        "reaction_emoji": reaction_emoji[:16],
     }
 
 
-def telegram_channel_context(user: dict[str, object], chat: dict[str, object], chat_type: str, is_authorized: bool) -> str:
+def telegram_channel_context(user: dict[str, object], chat: dict[str, object], chat_type: str, is_authorized: bool, participation_mode: str = "full") -> str:
     username = str(user.get("username") or "").strip()
     first_name = str(user.get("first_name") or "").strip()
     last_name = str(user.get("last_name") or "").strip()
@@ -653,6 +834,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     lines = [
         f"Telegram-область: {scope}.",
         f"Отправитель: {display_name}; упоминание username: {mention}; статус: {auth}.",
+        f"Режим участия Telegram: {participation_mode}.",
     ]
     if chat_title:
         lines.append(f"Название чата: {chat_title}.")
@@ -664,7 +846,8 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
             "В этой группе можно приватно запросить assistant_memory telegram_action: "
             "reply_to=group для компактного публичного ответа, reply_to=private для конфиденциальных/персональных данных, "
             "reply_to=both для короткой групповой реплики и более полного личного сообщения. "
-            "Используй mention_sender=true, когда обращаешься к отправителю в группе."
+            "Используй mention_sender=true, когда обращаешься к отправителю в группе. "
+            "Если достаточно реакции вместо ответа, добавь reaction_emoji, например 👍 или 👀."
         )
     return "\n".join(lines)
 
@@ -677,12 +860,16 @@ def telegram_sender_mention_text(user: dict[str, object]) -> str:
     return name or "пользователь"
 
 
-def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[str, object], chat_type: str, payload: dict[str, object]) -> dict[str, object]:
+def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[str, object], chat_type: str, payload: dict[str, object], message_id: object | None = None) -> dict[str, object]:
     answer = str(payload.get("text") or "")
-    action = sanitize_telegram_action(payload.get("telegram_action")) or {"reply_to": "group", "mention_sender": False, "group_text": "", "private_text": ""}
+    action = sanitize_telegram_action(payload.get("telegram_action")) or {"reply_to": "group", "mention_sender": False, "group_text": "", "private_text": "", "reaction_emoji": ""}
+    reaction_sent = False
+    reaction_emoji = str(action.get("reaction_emoji") or "").strip()
+    if reaction_emoji and message_id is not None:
+        reaction_sent = try_set_telegram_reaction(chat_id, message_id, reaction_emoji)
     if chat_type == "private":
         send_telegram_message(chat_id, str(action.get("private_text") or answer))
-        return {"telegram_route": "private"}
+        return {"telegram_route": "private", "telegram_reaction_sent": reaction_sent}
 
     reply_to = str(action.get("reply_to") or "group")
     group_text = str(action.get("group_text") or "").strip()
@@ -704,7 +891,7 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
         if not sent_private and not sent_group:
             send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Напиши мне /start в личном чате и повтори запрос.")
             sent_group = True
-    return {"telegram_route": reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private}
+    return {"telegram_route": reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private, "telegram_reaction_sent": reaction_sent}
 
 
 def try_send_telegram_message(chat_id: object, text: str) -> bool:
@@ -713,6 +900,44 @@ def try_send_telegram_message(chat_id: object, text: str) -> bool:
     except (HTTPError, URLError, TimeoutError, OSError, RuntimeError):
         return False
     return True
+
+
+def try_set_telegram_reaction(chat_id: object, message_id: object, emoji: str) -> bool:
+    try:
+        set_telegram_reaction(chat_id, message_id, emoji)
+    except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError):
+        audit_event("telegram_reaction_failed", chat_id=chat_id, message_id=message_id, emoji=emoji)
+        return False
+    audit_event("telegram_reaction_sent", chat_id=chat_id, message_id=message_id, emoji=emoji)
+    return True
+
+
+def set_telegram_reaction(chat_id: object, message_id: object, emoji: str) -> None:
+    if not TG_BOT_API_KEY:
+        return
+    reaction = emoji.strip()
+    if not reaction:
+        return
+    try:
+        numeric_message_id = int(str(message_id))
+    except ValueError as exc:
+        raise ValueError("message_id must be integer-like") from exc
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "message_id": numeric_message_id,
+            "reaction": [{"type": "emoji", "emoji": reaction[:16]}],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{TG_BOT_API_KEY}/setMessageReaction",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=20) as response:
+        response.read()
 
 def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: bool) -> str:
     username = user.get("username") or user.get("first_name") or "гость"

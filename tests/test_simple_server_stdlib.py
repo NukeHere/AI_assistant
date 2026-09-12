@@ -328,7 +328,7 @@ class SimpleServerTests(unittest.TestCase):
             simple_server.TG_BOT_API_KEY = old_key
 
         self.assertTrue(response["ignored"])
-        self.assertEqual(response["reason"], "secretary_mode")
+        self.assertEqual(response["reason"], "guest_group_chatter")
 
     def test_telegram_secretary_ignores_authorized_group_without_mention(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
@@ -348,7 +348,7 @@ class SimpleServerTests(unittest.TestCase):
             simple_server.send_telegram_message = old_send
 
         self.assertTrue(response["ignored"])
-        self.assertEqual(response["reason"], "secretary_mode")
+        self.assertEqual(response["reason"], "authorized_group_not_relevant")
 
     def test_telegram_secretary_allows_authorized_group_mention(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
@@ -422,9 +422,115 @@ class SimpleServerTests(unittest.TestCase):
         self.assertFalse(response["authorized"])
         self.assertTrue(sent)
 
+    def test_telegram_secretary_allows_reply_to_bot(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("да, продолжай", chat_type="group", reply_to_bot=True))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertEqual(response.get("participation_mode"), "active")
+        self.assertTrue(response["authorized"])
+        self.assertTrue(sent)
+
+    def test_telegram_secretary_allows_authorized_relevant_group_message(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("можешь помочь с памятью?", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertEqual(response.get("participation_mode"), "relevant")
+        self.assertTrue(response["authorized"])
+        self.assertTrue(sent)
+
+    def test_telegram_secretary_samples_authorized_background_messages(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_sample = simple_server.TG_AUTHORIZED_SAMPLE_EVERY
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.TG_AUTHORIZED_SAMPLE_EVERY = 3
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                first = simple_server.handle_telegram_update(telegram_update("общий шум один", chat_type="group", message_id=11))
+                second = simple_server.handle_telegram_update(telegram_update("общий шум два", chat_type="group", message_id=12))
+                third = simple_server.handle_telegram_update(telegram_update("общий шум три", chat_type="group", message_id=13))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.TG_AUTHORIZED_SAMPLE_EVERY = old_sample
+            simple_server.send_telegram_message = old_send
+
+        self.assertTrue(first["ignored"])
+        self.assertTrue(second["ignored"])
+        self.assertEqual(third["handled"], "message")
+        self.assertEqual(third.get("participation_mode"), "sample")
+
+    def test_telegram_reaction_update_is_logged_and_remembered_for_authorized_user(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+
+        def fake_send(chat_id: object, text: str) -> None:
+            return None
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update({
+                    "message_reaction": {
+                        "chat": {"id": 555, "type": "group"},
+                        "message_id": 42,
+                        "user": {"id": 777, "is_bot": False, "username": "telegram_user"},
+                        "old_reaction": [],
+                        "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+                    }
+                })
+                memory = simple_server.storage.list_memories("primary-user", limit=10)
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "reaction")
+        self.assertTrue(response["remembered"])
+        self.assertTrue(any("Telegram-реакция" in item["summary"] for item in memory))
+
     def test_telegram_addressing_uses_word_boundaries(self) -> None:
         self.assertFalse(simple_server.is_telegram_addressed("просто работай дальше"))
         self.assertTrue(simple_server.is_telegram_addressed("бот, ты тут?"))
+        self.assertTrue(simple_server.is_telegram_addressed("Anna, ты тут?"))
+        self.assertTrue(simple_server.is_telegram_addressed("Анна, ты тут?"))
         self.assertTrue(simple_server.is_telegram_addressed("@VBDsThirdSon_bot ты тут?"))
 
     def test_telegram_sender_mention_keeps_underscores(self) -> None:
@@ -572,36 +678,46 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(detect_persona_switch(sample_cases[11]), Persona.ANA)
 
 
-def telegram_update(text: str, chat_type: str = "private") -> dict[str, object]:
-    return {
-        "message": {
-            "message_id": 10,
-            "date": 1800000000,
-            "chat": {"id": 555, "type": chat_type},
-            "from": {
-                "id": 777,
-                "is_bot": False,
-                "username": "telegram_user",
-                "first_name": "Telegram",
-            },
-            "text": text,
-        }
+def telegram_update(text: str, chat_type: str = "private", reply_to_bot: bool = False, message_id: int = 10) -> dict[str, object]:
+    message: dict[str, object] = {
+        "message_id": message_id,
+        "date": 1800000000,
+        "chat": {"id": 555, "type": chat_type},
+        "from": {
+            "id": 777,
+            "is_bot": False,
+            "username": "telegram_user",
+            "first_name": "Telegram",
+        },
+        "text": text,
     }
+    if reply_to_bot:
+        message["reply_to_message"] = {
+            "message_id": 9,
+            "from": {"id": 8966254183, "is_bot": True, "username": "VBDsThirdSon_bot"},
+            "text": "предыдущее сообщение бота",
+        }
+    return {"message": message}
 
 class isolated_storage:
     def __enter__(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.old_storage = simple_server.storage
+        self.old_telegram_group_state = dict(simple_server.TELEGRAM_GROUP_STATE)
+        simple_server.TELEGRAM_GROUP_STATE.clear()
         simple_server.storage = Storage(Path(self.temp_dir.name) / "assistant.sqlite3")
         simple_server.storage.init()
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         simple_server.storage = self.old_storage
+        simple_server.TELEGRAM_GROUP_STATE.clear()
+        simple_server.TELEGRAM_GROUP_STATE.update(self.old_telegram_group_state)
         self.temp_dir.cleanup()
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
