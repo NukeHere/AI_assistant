@@ -17,7 +17,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -194,30 +193,36 @@ public class MainActivity extends Activity {
         topButtons.setGravity(Gravity.CENTER_VERTICAL);
 
         Button saveButton = new Button(this);
+        saveButton.setFocusable(false);
         saveButton.setText("Save");
         saveButton.setOnClickListener(v -> { saveSettings(); syncHistory(true); });
         topButtons.addView(saveButton, weightedButton());
 
         Button syncButton = new Button(this);
+        syncButton.setFocusable(false);
         syncButton.setText("Sync");
         syncButton.setOnClickListener(v -> syncHistory(true));
         topButtons.addView(syncButton, weightedButton());
 
         Button downButton = new Button(this);
+        downButton.setFocusable(false);
         downButton.setText("↓");
         downButton.setOnClickListener(v -> scrollToBottom());
         topButtons.addView(downButton, weightedButton());
 
         Button anaButton = new Button(this);
+        anaButton.setFocusable(false);
         anaButton.setText("ANA");
         anaButton.setOnClickListener(v -> sendText("/ana"));
         topButtons.addView(anaButton, weightedButton());
 
         Button timersButton = new Button(this);
+        timersButton.setFocusable(false);
         timersButton.setText("⏰");
         timersButton.setOnClickListener(v -> sendText("/timers"));
         topButtons.addView(timersButton, weightedButton());
         Button alienButton = new Button(this);
+        alienButton.setFocusable(false);
         alienButton.setText("ALIEN");
         alienButton.setOnClickListener(v -> sendText("/alien"));
         topButtons.addView(alienButton, weightedButton());
@@ -239,6 +244,7 @@ public class MainActivity extends Activity {
         root.addView(messageInput, matchWrap());
 
         sendButton = new Button(this);
+        sendButton.setFocusable(false);
         sendButton.setText("Отправить");
         sendButton.setTypeface(Typeface.DEFAULT_BOLD);
         sendButton.setOnClickListener(v -> sendCurrentText());
@@ -585,8 +591,16 @@ public class MainActivity extends Activity {
     }
 
     private void scrollToBottom() {
-        if (scrollView == null) return;
-        scrollView.postDelayed(() -> scrollView.fullScroll(View.FOCUS_DOWN), 80);
+        if (scrollView == null || historyView == null) return;
+        boolean restoreMessageFocus = messageInput != null && messageInput.hasFocus();
+        scrollView.postDelayed(() -> {
+            int bottom = Math.max(0, historyView.getBottom() - scrollView.getHeight());
+            scrollView.scrollTo(0, bottom);
+            if (restoreMessageFocus && messageInput != null) {
+                messageInput.requestFocus();
+                messageInput.setSelection(messageInput.getText().length());
+            }
+        }, 80);
     }
 
     private void setWaiting(boolean waiting) {
@@ -618,4 +632,5 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 }
+
 
