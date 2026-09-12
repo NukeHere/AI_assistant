@@ -67,6 +67,36 @@ def backup_filename(client_id: str, now: datetime | None = None) -> str:
     return f"assistant-snapshot-{safe_name(client_id)}-{stamp}.json"
 
 
+def snapshot_weight(snapshot: dict[str, object]) -> int:
+    return sum(
+        len(snapshot.get(key, []))
+        for key in ["conversations", "messages", "memories", "memory_cells", "timed_memories"]
+        if isinstance(snapshot.get(key, []), list)
+    )
+
+
+def load_backup_snapshot(path: Path) -> dict[str, object]:
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(snapshot, dict):
+        raise ValueError("Backup file must contain snapshot object")
+    return snapshot
+
+
+def desktop_snapshot_path(backup_dir: Path, client_id: str) -> Path:
+    base_dir = backup_dir.parent if backup_dir.name == "backups" else backup_dir
+    return base_dir / f"snapshot-{safe_name(client_id)}.json"
+
+
+def latest_backup(backup_dir: Path, client_id: str) -> Path | None:
+    candidates = list_backups(backup_dir, client_id)
+    desktop_snapshot = desktop_snapshot_path(backup_dir, client_id)
+    if desktop_snapshot.exists():
+        candidates.append(desktop_snapshot)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
 def save_backup(backup_dir: Path, client_id: str, snapshot: dict[str, object]) -> Path:
     backup_dir.mkdir(parents=True, exist_ok=True)
     path = backup_dir / backup_filename(client_id)
@@ -97,10 +127,26 @@ def export_backup(url: str, token: str, client_id: str, backup_dir: Path, keep: 
     return path
 
 
-def restore_backup(url: str, token: str, client_id: str, backup_path: Path) -> dict[str, object]:
-    snapshot = json.loads(backup_path.read_text(encoding="utf-8"))
+def sync_backup(url: str, token: str, client_id: str, backup_dir: Path, keep: int) -> tuple[str, Path | None]:
+    data = request_snapshot(url, token, {"action": "export", "client_id": client_id})
+    snapshot = data.get("snapshot")
     if not isinstance(snapshot, dict):
-        raise ValueError("Backup file must contain snapshot object")
+        raise ValueError("Export response does not contain snapshot object")
+
+    latest = latest_backup(backup_dir, client_id)
+    if latest is not None:
+        local_snapshot = load_backup_snapshot(latest)
+        if snapshot_weight(snapshot) < snapshot_weight(local_snapshot):
+            restore_backup(url, token, client_id, latest)
+            return "restored", latest
+
+    path = save_backup(backup_dir, client_id, snapshot)
+    prune_backups(backup_dir, client_id, keep)
+    return "saved", path
+
+
+def restore_backup(url: str, token: str, client_id: str, backup_path: Path) -> dict[str, object]:
+    snapshot = load_backup_snapshot(backup_path)
     return request_snapshot(url, token, {"action": "import", "client_id": client_id, "snapshot": snapshot})
 
 
@@ -116,16 +162,19 @@ def config_from_env() -> tuple[str, str, str, Path, int]:
     return snapshot_url(api_url), token, client_id, backup_dir, keep
 
 
-def run_once() -> Path:
+def run_once() -> tuple[str, Path | None]:
     url, token, client_id, backup_dir, keep = config_from_env()
-    return export_backup(url, token, client_id, backup_dir, keep)
+    return sync_backup(url, token, client_id, backup_dir, keep)
 
 
 def run_loop(interval_seconds: int) -> None:
     while True:
         try:
-            path = run_once()
-            print(f"Backup saved: {path}", flush=True)
+            action, path = run_once()
+            if action == "restored":
+                print(f"Backup restored to Render from: {path}", flush=True)
+            else:
+                print(f"Backup saved: {path}", flush=True)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
             print(f"Backup failed: {error}", flush=True)
         time.sleep(interval_seconds)
@@ -145,22 +194,28 @@ def main() -> None:
     url, token, client_id, backup_dir, keep = config_from_env()
     command = args.command or "once"
     if command == "once":
-        path = export_backup(url, token, client_id, backup_dir, keep)
-        print(f"Backup saved: {path}")
+        action, path = sync_backup(url, token, client_id, backup_dir, keep)
+        if action == "restored":
+            print(f"Backup restored to Render from: {path}")
+        else:
+            print(f"Backup saved: {path}")
     elif command == "loop":
-        run_loop(max(60, int(args.interval)))
+        run_loop(max(1, int(args.interval)))
     elif command == "restore":
         if args.path == "latest":
-            backups = list_backups(backup_dir, client_id)
-            if not backups:
+            backup_path = latest_backup(backup_dir, client_id)
+            if backup_path is None:
                 raise SystemExit("No backups found")
-            backup_path = backups[0]
         else:
             backup_path = Path(args.path)
         result = restore_backup(url, token, client_id, backup_path)
         print(json.dumps({"restored_from": str(backup_path), "result": result}, ensure_ascii=False, indent=2))
     elif command == "list":
-        for path in list_backups(backup_dir, client_id):
+        paths = list_backups(backup_dir, client_id)
+        desktop_snapshot = desktop_snapshot_path(backup_dir, client_id)
+        if desktop_snapshot.exists():
+            paths.append(desktop_snapshot)
+        for path in sorted(paths, key=lambda item: item.stat().st_mtime, reverse=True):
             print(path)
     else:
         parser.error(f"Unknown command: {command}")
@@ -168,3 +223,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
