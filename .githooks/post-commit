@@ -1,4 +1,4 @@
 #!/bin/sh
 # Fire-and-forget local Render snapshot sync after each commit.
 # The PowerShell script reads secrets only from local .env/environment and writes logs to ignored data/.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run_backup_agent_once.ps1 >/dev/null 2>&1 || true
+(powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run_backup_agent_once.ps1 >/dev/null 2>&1 &) || true
