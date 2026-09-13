@@ -103,7 +103,34 @@ def current_times() -> tuple[str, str]:
 
 def materialize_due(client_id: str, conversation_id: str) -> list[dict[str, object]]:
     now_utc, _ = current_times()
-    return storage.materialize_due_timed_memories(client_id, conversation_id, now_utc)
+    due_rows = storage.materialize_due_timed_memories(client_id, conversation_id, now_utc)
+    if due_rows:
+        notify_telegram_timed_memories(client_id, due_rows)
+    return due_rows
+
+
+def notify_telegram_timed_memories(client_id: str, due_rows: list[dict[str, object]]) -> None:
+    if not TG_BOT_API_KEY:
+        return
+    users = storage.telegram_users_for_app_client(client_id)
+    if not users:
+        audit_event("timed_memory_telegram_skipped", client_id=client_id, reason="no_linked_telegram_users", count=len(due_rows))
+        return
+    for timer in due_rows[:10]:
+        text = f"⏰ Напоминание: {timer.get('summary') or ''}\n{timer.get('full_content') or ''}".strip()
+        for user in users:
+            telegram_user_id = str(user.get("telegram_user_id") or "").strip()
+            if not telegram_user_id:
+                continue
+            sent = try_send_telegram_message(telegram_user_id, text)
+            audit_event(
+                "timed_memory_telegram_sent" if sent else "timed_memory_telegram_failed",
+                client_id=client_id,
+                telegram_user_id=telegram_user_id,
+                username=user.get("username"),
+                timer_uid=timer.get("timer_uid"),
+                text_preview=text,
+            )
 
 
 
@@ -987,16 +1014,36 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     reaction_only = bool(reaction_emoji) and reply_to != "both" and not group_text_explicit and not private_text_explicit
     if chat_type == "private":
         private_text_to_send = str(action.get("private_text") or answer)
+        explicit_private_target = bool(str(action.get("private_to_username") or "").strip() or str(action.get("private_to_telegram_user_id") or "").strip())
+        private_chat_id = str(chat_id)
+        unknown_recipient = ""
+        sent_private = False
+        if explicit_private_target:
+            resolved_private_chat_id, resolved_unknown_recipient = resolve_private_telegram_recipient(action, telegram_user_id)
+            private_chat_id = str(resolved_private_chat_id or "")
+            unknown_recipient = str(resolved_unknown_recipient or "")
         if not reaction_only:
-            send_telegram_message(chat_id, private_text_to_send)
+            if explicit_private_target:
+                if private_chat_id:
+                    sent_private = try_send_telegram_message(private_chat_id, private_text_to_send)
+                if not sent_private and unknown_recipient:
+                    fallback_text = f"Я пока не знаю Telegram chat_id получателя {unknown_recipient}. Пусть он напишет мне /start, потом повтори запрос."
+                    send_telegram_message(chat_id, fallback_text)
+                    private_text_to_send = fallback_text
+                    private_chat_id = str(chat_id)
+            else:
+                send_telegram_message(chat_id, private_text_to_send)
+                sent_private = True
         return {
             "telegram_route": "reaction" if reaction_only else "private",
+            "telegram_private_sent": sent_private,
             "telegram_reaction_sent": reaction_sent,
             "telegram_text_suppressed": reaction_only,
             "telegram_action_details": {
                 **telegram_action_audit_details(action),
                 "sent_private_text_preview": "" if reaction_only else text_preview(private_text_to_send),
-                "sent_private_to": str(chat_id),
+                "sent_private_to": private_chat_id,
+                "unknown_private_recipient": unknown_recipient,
             },
         }
 

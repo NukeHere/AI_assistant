@@ -758,6 +758,43 @@ class SimpleServerTests(unittest.TestCase):
         self.assertIn("@goldgooner", sent[-1][1])
         self.assertNotEqual(sent[-1][0], "777")
 
+    def test_telegram_action_private_chat_can_target_known_username(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Отправляю @goldgooner.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"private","private_to_username":"goldgooner","private_text":"277"}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.storage.upsert_telegram_user("888", username="goldgooner", first_name="Golden")
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("напиши @goldgooner 277"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "private")
+        self.assertTrue(response["telegram_private_sent"])
+        self.assertEqual(sent[-1], ("888", "277"))
+        self.assertEqual(response["telegram_action_details"]["sent_private_to"], "888")
+        self.assertNotEqual(response["telegram_action_details"]["sent_private_to"], "555")
+
     def test_telegram_reaction_action_suppresses_default_text(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
         old_send = simple_server.send_telegram_message

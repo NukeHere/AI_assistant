@@ -61,6 +61,34 @@ class TimedMemoryTests(unittest.TestCase):
         system_messages = [item["content"] for item in synced["messages"] if item["role"] == "system"]
         self.assertTrue(any("помидор" in item for item in system_messages))
 
+    def test_due_timed_memory_sends_telegram_dm_to_linked_user(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.storage.upsert_telegram_user("777", username="telegram_user")
+                simple_server.storage.link_telegram_user("777", "primary-user")
+                simple_server.storage.add_timed_memory(
+                    "primary-user",
+                    "due-test",
+                    "помидор",
+                    "Вспомнить слово помидор",
+                    "2000-01-01T00:00:00Z",
+                )
+                handle_sync_request({"client_id": "primary-user", "conversation_id": "due-test", "messages": []})
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(sent, [("777", "⏰ Напоминание: помидор\nВспомнить слово помидор")])
+
     def test_snapshot_roundtrip_keeps_timed_memories(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             first = Storage(Path(temp_dir) / "first.sqlite3")

@@ -906,6 +906,21 @@ class Storage:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def telegram_users_for_app_client(self, app_client_id: str) -> list[dict[str, Any]]:
+        clean_client_id = str(app_client_id or "").strip()
+        if not clean_client_id:
+            return []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                select * from telegram_users
+                 where app_client_id = ? and is_authorized = 1
+                 order by updated_at desc, telegram_user_id asc
+                """,
+                (clean_client_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def link_telegram_user(self, telegram_user_id: str, app_client_id: str) -> dict[str, Any]:
         clean_client_id = app_client_id.strip()[:128]
         if not clean_client_id:

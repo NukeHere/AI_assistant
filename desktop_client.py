@@ -104,7 +104,6 @@ class ChatApp(tk.Tk):
         self.client_id_var = tk.StringVar(value=CLIENT_ID)
         self.client_id_entry = tk.Entry(id_row, textvariable=self.client_id_var)
         self.client_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
-        self._bind_entry_shortcuts(self.client_id_entry)
         tk.Button(id_row, text="Сохранить ID", command=self._save_client_id_from_ui).pack(side=tk.RIGHT)
 
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
@@ -130,6 +129,7 @@ class ChatApp(tk.Tk):
         self.input.bind("<Shift-Return>", self._handle_shift_enter)
         self.input.bind("<Control-a>", self._select_all_input)
         self.input.bind("<Control-A>", self._select_all_input)
+        self._install_clipboard_shortcuts()
 
         self.send_button = tk.Button(bottom, text="Отправить", command=self.send_message)
         self.send_button.pack(side=tk.RIGHT, padx=(8, 0), fill=tk.Y)
@@ -394,32 +394,114 @@ class ChatApp(tk.Tk):
         self.input.mark_set(tk.INSERT, "1.0")
         self.input.see(tk.INSERT)
         return "break"
-    def _bind_entry_shortcuts(self, entry: tk.Entry) -> None:
-        for sequence in ("<Control-c>", "<Control-C>"):
-            entry.bind(sequence, self._entry_copy)
-        for sequence in ("<Control-v>", "<Control-V>"):
-            entry.bind(sequence, self._entry_paste)
-        for sequence in ("<Control-x>", "<Control-X>"):
-            entry.bind(sequence, self._entry_cut)
-        for sequence in ("<Control-a>", "<Control-A>"):
-            entry.bind(sequence, self._entry_select_all)
+    def _install_clipboard_shortcuts(self) -> None:
+        # Tk на Windows привязывает <Control-v>/<Control-c> к символу текущей раскладки.
+        # На русской раскладке Ctrl+V приходит как Ctrl+м, поэтому обрабатываем KeyPress
+        # по physical keycode/keysym и вручную применяем операцию к активному виджету.
+        for widget in (self.client_id_entry, self.input, self.history):
+            widget.bind("<KeyPress>", self._handle_clipboard_shortcut, add="+")
 
-    def _entry_copy(self, event: tk.Event) -> str:
-        event.widget.event_generate("<<Copy>>")
+    def _handle_clipboard_shortcut(self, event: tk.Event) -> str | None:
+        if not self._event_has_control(event):
+            return None
+        action = self._clipboard_action_from_event(event)
+        if action is None:
+            return None
+        widget = event.widget
+        if action == "copy":
+            return self._copy_from_widget(widget)
+        if action == "paste":
+            return self._paste_into_widget(widget)
+        if action == "cut":
+            copied = self._copy_from_widget(widget)
+            if copied == "break":
+                self._delete_widget_selection(widget)
+            return "break"
+        if action == "select_all":
+            return self._select_all_widget(widget)
+        return None
+
+    def _event_has_control(self, event: tk.Event) -> bool:
+        return bool(int(getattr(event, "state", 0) or 0) & 0x0004)
+
+    def _clipboard_action_from_event(self, event: tk.Event) -> str | None:
+        keycode = int(getattr(event, "keycode", 0) or 0)
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        char = str(getattr(event, "char", "") or "").lower()
+        key = keysym or char
+        if keycode == 67 or key in {"c", "с"}:
+            return "copy"
+        if keycode == 86 or key in {"v", "м"}:
+            return "paste"
+        if keycode == 88 or key in {"x", "ч"}:
+            return "cut"
+        if keycode == 65 or key in {"a", "ф"}:
+            return "select_all"
+        return None
+
+    def _copy_from_widget(self, widget: tk.Widget) -> str:
+        try:
+            if isinstance(widget, tk.Entry):
+                text = widget.selection_get()
+            elif isinstance(widget, tk.Text):
+                text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            else:
+                return "break"
+        except tk.TclError:
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(text)
         return "break"
 
-    def _entry_paste(self, event: tk.Event) -> str:
-        event.widget.event_generate("<<Paste>>")
+    def _paste_into_widget(self, widget: tk.Widget) -> str:
+        if self._widget_is_readonly(widget):
+            return "break"
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if isinstance(widget, tk.Entry):
+            try:
+                start = widget.index(tk.SEL_FIRST)
+                end = widget.index(tk.SEL_LAST)
+                widget.delete(start, end)
+            except tk.TclError:
+                pass
+            widget.insert(tk.INSERT, text)
+        elif isinstance(widget, tk.Text):
+            try:
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                pass
+            widget.insert(tk.INSERT, text)
         return "break"
 
-    def _entry_cut(self, event: tk.Event) -> str:
-        event.widget.event_generate("<<Cut>>")
+    def _delete_widget_selection(self, widget: tk.Widget) -> None:
+        if self._widget_is_readonly(widget):
+            return
+        try:
+            if isinstance(widget, tk.Entry):
+                widget.delete(widget.index(tk.SEL_FIRST), widget.index(tk.SEL_LAST))
+            elif isinstance(widget, tk.Text):
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return
+
+    def _select_all_widget(self, widget: tk.Widget) -> str:
+        if isinstance(widget, tk.Entry):
+            widget.selection_range(0, tk.END)
+            widget.icursor(tk.END)
+        elif isinstance(widget, tk.Text):
+            widget.tag_add(tk.SEL, "1.0", tk.END)
+            widget.mark_set(tk.INSERT, "1.0")
+            widget.see(tk.INSERT)
         return "break"
 
-    def _entry_select_all(self, event: tk.Event) -> str:
-        event.widget.selection_range(0, tk.END)
-        event.widget.icursor(tk.END)
-        return "break"
+    def _widget_is_readonly(self, widget: tk.Widget) -> bool:
+        try:
+            return str(widget.cget("state")) in {"disabled", "readonly"}
+        except tk.TclError:
+            return False
 
     def _show_history_menu(self, event: tk.Event) -> str:
         try:
