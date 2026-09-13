@@ -11,6 +11,7 @@ from simple_server import (
     handle_history_request,
     handle_message_request,
     handle_snapshot_request,
+    handle_client_register_request,
     mock_response,
     provider_mode,
     valid_messages,
@@ -45,6 +46,17 @@ class SimpleServerTests(unittest.TestCase):
 
     def test_default_provider_is_mock(self) -> None:
         self.assertEqual(provider_mode(), "mock")
+
+
+    def test_client_register_creates_or_accepts_client_id(self) -> None:
+        with isolated_storage():
+            created = handle_client_register_request({"device_id": "desktop-test", "app": "desktop"})
+            existing = handle_client_register_request({"client_id": "desktop-test-123", "conversation_id": "default"})
+
+        self.assertTrue(created["client_id"].startswith("desktop-test-"))
+        self.assertEqual(created["telegram_link_command"], f"/link {created['client_id']}")
+        self.assertEqual(existing["client_id"], "desktop-test-123")
+        self.assertEqual(existing["telegram_link_command"], "/link desktop-test-123")
 
     def test_message_endpoint_switches_persona_and_keeps_context(self) -> None:
         with isolated_storage():
@@ -617,6 +629,78 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(response["telegram_group_sent"])
         self.assertEqual(sent[-1][0], 555)
         self.assertIn("@telegram_user", sent[-1][1])
+
+
+    def test_telegram_action_private_can_target_known_username(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Отправляю лично.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"private","private_to_username":"goldgooner","private_text":"бздын"}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.storage.upsert_telegram_user("888", username="goldgooner", first_name="Golden")
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot напиши @goldgooner в личные сообщение слова бздын", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "private")
+        self.assertTrue(response["telegram_private_sent"])
+        self.assertEqual(sent[-1], ("888", "бздын"))
+
+    def test_telegram_action_private_unknown_username_does_not_send_to_requester(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Пробую написать лично.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"private","private_to_username":"goldgooner","private_text":"бздын"}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot напиши @goldgooner в личные сообщение слова бздын", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "private")
+        self.assertFalse(response["telegram_private_sent"])
+        self.assertEqual(sent[-1][0], 555)
+        self.assertIn("@goldgooner", sent[-1][1])
+        self.assertNotEqual(sent[-1][0], "777")
 
     def test_telegram_reaction_action_suppresses_default_text(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY

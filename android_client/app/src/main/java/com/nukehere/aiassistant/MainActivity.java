@@ -7,6 +7,8 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -51,8 +53,8 @@ import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
     private static final String PREFS = "ai_assistant_prefs";
+    private static final String PREF_CLIENT_ID = "client_id";
     private static final String DEFAULT_URL = "https://ai-assistant-4yn0.onrender.com/v1/message";
-    private static final String CLIENT_ID = "primary-user";
     private static final String CONVERSATION_ID = "default";
     private static final String DEVICE_ID = "android-" + android.os.Build.MODEL.replaceAll("[^a-zA-Z0-9_.-]+", "_");
     private static final int HISTORY_KEEP = 400;
@@ -69,11 +71,13 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private EditText apiUrlInput;
     private EditText tokenInput;
+    private EditText clientIdInput;
     private ScrollView scrollView;
     private TextView historyView;
     private EditText messageInput;
     private Button sendButton;
     private String persona = "ANA";
+    private String clientId;
     private final List<JSONObject> events = new ArrayList<>();
     private final HashSet<String> notifiedTimerIds = new HashSet<>();
     private boolean syncRunning = false;
@@ -82,6 +86,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        clientId = getOrCreateClientId();
         setupNotifications();
         notifiedTimerIds.addAll(prefs.getStringSet("notified_timer_ids", new HashSet<>()));
         events.addAll(loadEvents());
@@ -97,6 +102,16 @@ public class MainActivity extends Activity {
             scheduleAutoSync();
         }, AUTO_SYNC_MS);
     }
+    private String getOrCreateClientId() {
+        String saved = prefs.getString(PREF_CLIENT_ID, "");
+        if (saved != null && !saved.trim().isEmpty()) return saved.trim();
+        String model = android.os.Build.MODEL.replaceAll("[^a-zA-Z0-9_.-]+", "_");
+        String id = ("android-" + model + "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8));
+        if (id.length() > 128) id = id.substring(0, 128);
+        prefs.edit().putString(PREF_CLIENT_ID, id).apply();
+        return id;
+    }
+
     private void setupNotifications() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -188,6 +203,13 @@ public class MainActivity extends Activity {
         tokenInput.setHint("APP_API_TOKEN");
         root.addView(tokenInput, matchWrap());
 
+        clientIdInput = new EditText(this);
+        clientIdInput.setSingleLine(true);
+        clientIdInput.setInputType(InputType.TYPE_CLASS_TEXT);
+        clientIdInput.setText(clientId);
+        clientIdInput.setHint("Client ID для /link в Telegram");
+        root.addView(clientIdInput, matchWrap());
+
         LinearLayout topButtons = new LinearLayout(this);
         topButtons.setOrientation(LinearLayout.HORIZONTAL);
         topButtons.setGravity(Gravity.CENTER_VERTICAL);
@@ -203,6 +225,12 @@ public class MainActivity extends Activity {
         syncButton.setText("Sync");
         syncButton.setOnClickListener(v -> syncHistory(true));
         topButtons.addView(syncButton, weightedButton());
+
+        Button idButton = new Button(this);
+        idButton.setFocusable(false);
+        idButton.setText("ID");
+        idButton.setOnClickListener(v -> copyClientId());
+        topButtons.addView(idButton, weightedButton());
 
         Button downButton = new Button(this);
         downButton.setFocusable(false);
@@ -263,7 +291,26 @@ public class MainActivity extends Activity {
         prefs.edit()
                 .putString("api_url", apiUrlInput.getText().toString().trim())
                 .putString("api_token", tokenInput.getText().toString().trim())
+                .putString(PREF_CLIENT_ID, currentClientId())
                 .apply();
+        clientId = currentClientId();
+    }
+
+    private String currentClientId() {
+        String value = clientIdInput == null ? clientId : clientIdInput.getText().toString().trim();
+        if (value.isEmpty()) value = clientId;
+        if (value.length() > 128) value = value.substring(0, 128);
+        return value;
+    }
+
+    private void copyClientId() {
+        clientId = currentClientId();
+        prefs.edit().putString(PREF_CLIENT_ID, clientId).apply();
+        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboard != null) {
+            clipboard.setPrimaryClip(ClipData.newPlainText("AI Assistant Telegram link", "/link " + clientId));
+            Toast.makeText(this, "Скопировано: /link " + clientId, Toast.LENGTH_SHORT).show();
+        }
     }
 
     private List<JSONObject> loadEvents() {
@@ -296,13 +343,15 @@ public class MainActivity extends Activity {
         String token = tokenInput.getText().toString().trim();
         if (token.isEmpty()) return;
         syncRunning = true;
-        executor.execute(() -> requestSync(showToast, token));
+        String activeClientId = currentClientId();
+        String activeApiUrl = apiUrlInput.getText().toString().trim();
+        executor.execute(() -> requestSync(showToast, token, activeClientId, activeApiUrl));
     }
 
-    private void requestSync(boolean showToast, String apiToken) {
+    private void requestSync(boolean showToast, String apiToken, String activeClientId, String activeApiUrl) {
         try {
             JSONObject body = new JSONObject();
-            body.put("client_id", CLIENT_ID);
+            body.put("client_id", activeClientId);
             body.put("conversation_id", CONVERSATION_ID);
             body.put("device_id", DEVICE_ID);
             body.put("limit", HISTORY_KEEP);
@@ -311,7 +360,12 @@ public class MainActivity extends Activity {
                 if (!"system".equals(event.optString("role"))) messages.put(toServerEvent(event));
             }
             body.put("messages", messages);
-            JSONObject response = postJson(endpointUrl("/v1/sync"), apiToken, body, 45000);
+            postJson(endpointUrl(activeApiUrl, "/v1/client/register"), apiToken, new JSONObject()
+                    .put("client_id", activeClientId)
+                    .put("conversation_id", CONVERSATION_ID)
+                    .put("device_id", DEVICE_ID)
+                    .put("app", "android"), 30000);
+            JSONObject response = postJson(endpointUrl(activeApiUrl, "/v1/sync"), apiToken, body, 45000);
             mainHandler.post(() -> {
                 syncRunning = false;
                 mergeServerMessages(response);
@@ -334,23 +388,26 @@ public class MainActivity extends Activity {
 
     private void sendText(String text) {
         saveSettings();
+        String activeClientId = currentClientId();
+        String activeApiUrl = apiUrlInput.getText().toString().trim();
+        String activeApiToken = tokenInput.getText().toString().trim();
         JSONObject userEvent = makeEvent("user", "Вы", text);
         events.add(userEvent);
         saveEvents();
         renderHistory();
         setWaiting(true);
-        executor.execute(() -> requestAnswer(text));
+        executor.execute(() -> requestAnswer(text, activeClientId, activeApiToken, activeApiUrl));
     }
 
-    private void requestAnswer(String text) {
+    private void requestAnswer(String text, String activeClientId, String apiToken, String activeApiUrl) {
         try {
-            String apiToken = requireToken();
+            if (apiToken.isEmpty()) throw new IllegalStateException("APP_API_TOKEN пустой");
             JSONObject body = new JSONObject();
-            body.put("client_id", CLIENT_ID);
+            body.put("client_id", activeClientId);
             body.put("conversation_id", CONVERSATION_ID);
             body.put("text", text);
             body.put("input_type", "text");
-            JSONObject response = postJson(apiUrlInput.getText().toString().trim(), apiToken, body, 120000);
+            JSONObject response = postJson(activeApiUrl, apiToken, body, 120000);
             String newPersona = response.optString("persona", persona);
             String answer = response.optString("text", "");
             mainHandler.post(() -> {
@@ -404,7 +461,11 @@ public class MainActivity extends Activity {
     }
 
     private String endpointUrl(String endpoint) {
-        String stripped = apiUrlInput.getText().toString().trim();
+        return endpointUrl(apiUrlInput.getText().toString().trim(), endpoint);
+    }
+
+    private String endpointUrl(String baseUrl, String endpoint) {
+        String stripped = baseUrl.trim();
         String[] suffixes = {"/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync", "/v1/chat/simple"};
         for (String suffix : suffixes) {
             if (stripped.endsWith(suffix)) return stripped.substring(0, stripped.length() - suffix.length()) + endpoint;

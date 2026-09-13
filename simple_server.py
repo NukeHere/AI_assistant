@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,6 +105,37 @@ def materialize_due(client_id: str, conversation_id: str) -> list[dict[str, obje
     now_utc, _ = current_times()
     return storage.materialize_due_timed_memories(client_id, conversation_id, now_utc)
 
+
+
+def clean_client_id(value: object) -> str:
+    raw = str(value or "").strip()[:128]
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", raw).strip("-._")
+
+
+def new_client_id(prefix: str = "user") -> str:
+    clean_prefix = clean_client_id(prefix) or "user"
+    return f"{clean_prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def handle_client_register_request(body: dict[str, object]) -> dict[str, object]:
+    requested = clean_client_id(body.get("client_id"))
+    device_prefix = clean_client_id(body.get("device_id")) or clean_client_id(body.get("prefix")) or clean_client_id(body.get("app")) or "user"
+    client_id = requested or new_client_id(device_prefix)
+    conversation_id = clean_client_id(body.get("conversation_id")) or DEFAULT_CONVERSATION_ID
+    storage.ensure_conversation(client_id, conversation_id)
+    audit_event(
+        "client_registered",
+        client_id=client_id,
+        conversation_id=conversation_id,
+        device_id=body.get("device_id"),
+        app=body.get("app"),
+    )
+    return {
+        "ok": True,
+        "client_id": client_id,
+        "conversation_id": conversation_id,
+        "telegram_link_command": f"/link {client_id}",
+    }
 
 def complete(messages: list[dict[str, str]]) -> tuple[str, str]:
     if MODEL_PROVIDER == "ollama":
@@ -813,12 +845,16 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
     group_text = str(action.get("group_text") or "").strip()
     private_text = str(action.get("private_text") or "").strip()
     reaction_emoji = str(action.get("reaction_emoji") or action.get("emoji") or "").strip()
+    private_to_username = str(action.get("private_to_username") or action.get("to_username") or action.get("recipient_username") or "").strip().lstrip("@")
+    private_to_telegram_user_id = str(action.get("private_to_telegram_user_id") or action.get("to_telegram_user_id") or action.get("recipient_telegram_user_id") or "").strip()
     return {
         "reply_to": reply_to,
         "mention_sender": bool(action.get("mention_sender") or action.get("mention_user")),
         "group_text": group_text[:2000],
         "private_text": private_text[:3800],
         "reaction_emoji": reaction_emoji[:16],
+        "private_to_username": private_to_username[:64],
+        "private_to_telegram_user_id": private_to_telegram_user_id[:64],
         "group_text_explicit": bool(group_text),
         "private_text_explicit": bool(private_text),
     }
@@ -848,6 +884,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
             "В этой группе можно приватно запросить assistant_memory telegram_action: "
             "reply_to=group для компактного публичного ответа, reply_to=private для конфиденциальных/персональных данных, "
             "reply_to=both для короткой групповой реплики и более полного личного сообщения. "
+            "По умолчанию private идёт отправителю; если нужно написать другому человеку, явно укажи private_to_username или private_to_telegram_user_id и private_text. "
             "Используй mention_sender=true, когда обращаешься к отправителю в группе. "
             "Если достаточно реакции вместо ответа, добавь reaction_emoji, например 👍 или 👀, и не дублируй это текстом. "
             "Текст вместе с реакцией отправляй только когда он явно нужен."
@@ -896,12 +933,30 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
         send_telegram_message(chat_id, group_text)
         sent_group = True
     if reply_to in {"private", "both"} and private_text:
-        sent_private = try_send_telegram_message(telegram_user_id, private_text)
+        private_chat_id, unknown_recipient = resolve_private_telegram_recipient(action, telegram_user_id)
+        if private_chat_id:
+            sent_private = try_send_telegram_message(private_chat_id, private_text)
         if not sent_private and not sent_group:
-            send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Напиши мне /start в личном чате и повтори запрос.")
+            if unknown_recipient:
+                send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, я пока не знаю Telegram chat_id получателя {unknown_recipient}. Пусть он напишет мне /start, потом повтори запрос.")
+            else:
+                send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Пользователь должен сначала написать мне /start в личном чате.")
             sent_group = True
     return {"telegram_route": "reaction" if reaction_only else reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private, "telegram_reaction_sent": reaction_sent, "telegram_text_suppressed": reaction_only}
 
+
+
+def resolve_private_telegram_recipient(action: dict[str, object], sender_telegram_user_id: str) -> tuple[str | None, str | None]:
+    explicit_id = str(action.get("private_to_telegram_user_id") or "").strip()
+    if explicit_id:
+        return explicit_id, None
+    username = str(action.get("private_to_username") or "").strip().lstrip("@")
+    if username:
+        user = storage.get_telegram_user_by_username(username)
+        if user is not None:
+            return str(user.get("telegram_user_id") or "").strip() or None, None
+        return None, f"@{username}"
+    return sender_telegram_user_id, None
 
 def try_send_telegram_message(chat_id: object, text: str) -> bool:
     try:
@@ -1119,6 +1174,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "snapshot_endpoint": "/v1/snapshot",
                 "sync_endpoint": "/v1/sync",
                 "logs_endpoint": "/v1/logs",
+        "client_register_endpoint": "/v1/client/register",
                 "smart_memory": True,
                 "render_blocks": True,
                 "timed_memory": True,
@@ -1170,6 +1226,9 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/v1/logs":
                 self.send_json(handle_logs_request(body))
+                return
+            if self.path == "/v1/client/register":
+                self.send_json(handle_client_register_request(body))
                 return
             if self.path == "/v1/message":
                 self.send_json(handle_message_request(body))
@@ -1231,7 +1290,7 @@ def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
-    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
+    print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/client/register, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
     server.serve_forever()
 

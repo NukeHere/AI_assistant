@@ -40,10 +40,33 @@ def utc_now() -> str:
 load_local_env()
 API_URL = os.getenv("ASSISTANT_API_URL", "https://ai-assistant-4yn0.onrender.com/v1/message")
 API_TOKEN = os.getenv("APP_API_TOKEN", "dev-token")
-CLIENT_ID = os.getenv("ASSISTANT_CLIENT_ID", "primary-user")
+LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_assistant"))
+CLIENT_CONFIG_PATH = LOCAL_DATA_DIR / "client-config.json"
 DEVICE_ID = os.getenv("ASSISTANT_DEVICE_ID", f"desktop-{safe_name(os.environ.get('COMPUTERNAME', 'windows'))}")
 CONVERSATION_ID = os.getenv("ASSISTANT_CONVERSATION_ID", "default")
-LOCAL_DATA_DIR = Path(os.getenv("ASSISTANT_LOCAL_DATA_DIR", Path.home() / ".ai_assistant"))
+
+
+def load_or_create_client_id() -> str:
+    env_client_id = os.getenv("ASSISTANT_CLIENT_ID", "").strip()
+    if env_client_id:
+        return env_client_id[:128]
+    try:
+        data = json.loads(CLIENT_CONFIG_PATH.read_text(encoding="utf-8"))
+        value = str(data.get("client_id") or "").strip()
+        if value:
+            return value[:128]
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    client_id = f"{DEVICE_ID}-{uuid.uuid4().hex[:8]}"[:128]
+    try:
+        LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        CLIENT_CONFIG_PATH.write_text(json.dumps({"client_id": client_id, "device_id": DEVICE_ID}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return client_id
+
+
+CLIENT_ID = load_or_create_client_id()
 HISTORY_PATH = LOCAL_DATA_DIR / f"history-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
 SNAPSHOT_PATH = LOCAL_DATA_DIR / f"snapshot-{safe_name(CLIENT_ID)}.json"
 NOTIFIED_TIMERS_PATH = LOCAL_DATA_DIR / f"notified-timers-{safe_name(CLIENT_ID)}-{safe_name(CONVERSATION_ID)}.json"
@@ -59,6 +82,7 @@ class ChatApp(tk.Tk):
         self.minsize(540, 440)
 
         self.results: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.client_id = CLIENT_ID
         self.persona = "ANA"
         self.chat_log = self._load_local_history()
         self.notified_timer_ids = self._load_notified_timer_ids()
@@ -72,6 +96,15 @@ class ChatApp(tk.Tk):
         tk.Button(quick, text="ALIEN", command=lambda: self._send_quick("/alien")).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(quick, text="Память", command=lambda: self._send_quick("/memory")).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(quick, text="Функции", command=lambda: self._send_quick("/functions")).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="Копировать ID", command=self._copy_client_id).pack(side=tk.LEFT, padx=(6, 0))
+
+        id_row = tk.Frame(self)
+        id_row.pack(fill=tk.X, padx=12, pady=(6, 0))
+        tk.Label(id_row, text="Client ID:").pack(side=tk.LEFT)
+        self.client_id_var = tk.StringVar(value=CLIENT_ID)
+        self.client_id_entry = tk.Entry(id_row, textvariable=self.client_id_var)
+        self.client_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+        tk.Button(id_row, text="Сохранить ID", command=self._save_client_id_from_ui).pack(side=tk.RIGHT)
 
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
         self._configure_history_tags()
@@ -106,6 +139,7 @@ class ChatApp(tk.Tk):
         else:
             self._append_system("Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /timers, /functions.")
         self.after(100, self._poll_results)
+        self.after(150, self._register_client_async)
         self.after(200, self._sync_history_async)
         self.after(500, self._restore_snapshot_async)
         self.after(SYNC_INTERVAL_MS, self._periodic_sync)
@@ -230,6 +264,21 @@ class ChatApp(tk.Tk):
     def _sync_url(self) -> str | None:
         return self._endpoint_url("/v1/sync")
 
+    def _register_url(self) -> str | None:
+        return self._endpoint_url("/v1/client/register")
+
+    def _register_client_async(self) -> None:
+        if self._register_url() is None:
+            return
+        client_id = self._current_client_id()
+        threading.Thread(target=self._register_client, args=(client_id,), daemon=True).start()
+
+    def _register_client(self, client_id: str) -> None:
+        try:
+            self._post_json(self._register_url(), {"client_id": client_id, "conversation_id": CONVERSATION_ID, "device_id": DEVICE_ID, "app": "desktop"}, timeout=30)
+        except (OSError, HTTPError, URLError, TimeoutError, KeyError, ValueError, json.JSONDecodeError):
+            return
+
     def _periodic_sync(self) -> None:
         self._sync_history_async()
         self.after(SYNC_INTERVAL_MS, self._periodic_sync)
@@ -237,12 +286,14 @@ class ChatApp(tk.Tk):
         if self._sync_url() is None or self._sync_running:
             return
         self._sync_running = True
-        threading.Thread(target=self._sync_history_with_server, daemon=True).start()
+        client_id = self._current_client_id()
+        threading.Thread(target=self._sync_history_with_server, args=(client_id,), daemon=True).start()
 
-    def _sync_history_with_server(self) -> None:
+    def _sync_history_with_server(self, client_id: str | None = None) -> None:
+        client_id = client_id or self.client_id
         try:
             payload = {
-                "client_id": CLIENT_ID,
+                "client_id": client_id,
                 "conversation_id": CONVERSATION_ID,
                 "device_id": DEVICE_ID,
                 "limit": HISTORY_KEEP,
@@ -272,19 +323,20 @@ class ChatApp(tk.Tk):
     def _restore_snapshot(self) -> None:
         try:
             snapshot = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
-            self._post_json(self._snapshot_url(), {"action": "import", "client_id": CLIENT_ID, "snapshot": snapshot}, timeout=45)
-            self._sync_history_with_server()
+            self._post_json(self._snapshot_url(), {"action": "import", "client_id": self.client_id, "snapshot": snapshot}, timeout=45)
+            self._sync_history_with_server(self.client_id)
         except (OSError, json.JSONDecodeError, HTTPError, URLError, TimeoutError, KeyError, ValueError):
             return
 
     def _backup_snapshot_async(self) -> None:
         if self._snapshot_url() is None:
             return
-        threading.Thread(target=self._backup_snapshot, daemon=True).start()
+        client_id = self._current_client_id()
+        threading.Thread(target=self._backup_snapshot, args=(client_id,), daemon=True).start()
 
-    def _backup_snapshot(self) -> None:
+    def _backup_snapshot(self, client_id: str) -> None:
         try:
-            data = self._post_json(self._snapshot_url(), {"action": "export", "client_id": CLIENT_ID}, timeout=45)
+            data = self._post_json(self._snapshot_url(), {"action": "export", "client_id": client_id}, timeout=45)
             snapshot = data.get("snapshot")
             if isinstance(snapshot, dict):
                 LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -355,6 +407,27 @@ class ChatApp(tk.Tk):
             self.clipboard_append(text)
         return "break"
 
+    def _current_client_id(self) -> str:
+        value = self.client_id_var.get().strip() if hasattr(self, "client_id_var") else self.client_id
+        return value[:128] or self.client_id
+
+    def _copy_client_id(self) -> None:
+        client_id = self._current_client_id()
+        self.clipboard_clear()
+        self.clipboard_append(f"/link {client_id}")
+        self._append_system(f"Команда привязки Telegram скопирована: /link {client_id}")
+
+    def _save_client_id_from_ui(self) -> None:
+        client_id = self._current_client_id()
+        try:
+            LOCAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            CLIENT_CONFIG_PATH.write_text(json.dumps({"client_id": client_id, "device_id": DEVICE_ID}, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.client_id = client_id
+            self._append_system("Client ID сохранён. Чтобы полностью переключить локальные файлы истории/snapshot на этот ID, перезапусти приложение.")
+            self._register_client_async()
+        except OSError as error:
+            messagebox.showerror("Client ID", str(error))
+
     def _send_quick(self, text: str) -> None:
         self.input.delete("1.0", tk.END)
         self.input.insert("1.0", text)
@@ -367,22 +440,23 @@ class ChatApp(tk.Tk):
         self.input.delete("1.0", tk.END)
         self._append_entry(self._new_entry("user", "Вы", text))
         self._set_waiting(True)
-        threading.Thread(target=self._request_answer, args=(text,), daemon=True).start()
+        client_id = self._current_client_id()
+        threading.Thread(target=self._request_answer, args=(text, client_id), daemon=True).start()
         return "break"
 
-    def _request_answer(self, text: str) -> None:
+    def _request_answer(self, text: str, client_id: str) -> None:
         try:
             if API_URL.rstrip("/").endswith("/v1/chat/simple"):
                 payload_body = {"messages": [{"role": "system", "content": "You are a helpful AI assistant."}, {"role": "user", "content": text}]}
             else:
-                payload_body = {"client_id": CLIENT_ID, "conversation_id": CONVERSATION_ID, "text": text, "input_type": "text"}
+                payload_body = {"client_id": client_id, "conversation_id": CONVERSATION_ID, "text": text, "input_type": "text"}
             data = self._post_json(API_URL, payload_body, timeout=120)
             persona = data.get("persona")
             if isinstance(persona, str):
                 self.persona = persona
             answer = str(data.get("text") or "")
             self.results.put(("assistant", {"text": answer, "persona": self.persona, "blocks": data.get("render_blocks")}))
-            self._backup_snapshot_async()
+            threading.Thread(target=self._backup_snapshot, args=(client_id,), daemon=True).start()
         except HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
             self.results.put(("error", f"HTTP {error.code}: {details}"))

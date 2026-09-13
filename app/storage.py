@@ -890,6 +890,22 @@ class Storage:
             row = conn.execute("select * from telegram_users where telegram_user_id = ?", (telegram_user_id,)).fetchone()
         return dict(row) if row is not None else None
 
+    def get_telegram_user_by_username(self, username: str) -> dict[str, Any] | None:
+        clean_username = username.strip().lstrip("@").lower()
+        if not clean_username:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                select * from telegram_users
+                 where lower(username) = ?
+                 order by is_authorized desc, updated_at desc
+                 limit 1
+                """,
+                (clean_username,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def link_telegram_user(self, telegram_user_id: str, app_client_id: str) -> dict[str, Any]:
         clean_client_id = app_client_id.strip()[:128]
         if not clean_client_id:
