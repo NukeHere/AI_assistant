@@ -15,8 +15,13 @@ if (Test-Path -LiteralPath $venvPython) {
 }
 for ($attempt = 1; $attempt -le 12; $attempt++) {
     $time = Get-Date -Format "s"
-    Add-Content -LiteralPath $outLog -Value "[$time] post-commit backup attempt $attempt"
-    & $pythonExe @arguments 1>> $outLog 2>> $errLog
+    Add-Content -LiteralPath $outLog -Encoding UTF8 -Value "[$time] post-commit backup attempt $attempt"
+    $output = & $pythonExe @arguments 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $output | Out-File -LiteralPath $outLog -Append -Encoding UTF8
+    } else {
+        $output | Out-File -LiteralPath $errLog -Append -Encoding UTF8
+    }
     if ($attempt -lt 12) {
         Start-Sleep -Seconds 10
     }
