@@ -14,6 +14,7 @@ DEFAULT_API_URL = "https://ai-assistant-4yn0.onrender.com/v1/message"
 DEFAULT_CLIENT_ID = "primary-user"
 DEFAULT_KEEP = 10
 DEFAULT_INTERVAL_SECONDS = 10
+CRITICAL_SECTIONS = ["telegram_users", "memory_cells", "timed_memories"]
 
 
 def load_local_env() -> None:
@@ -83,12 +84,26 @@ def snapshot_section_count(snapshot: dict[str, object], section: str) -> int:
 def snapshot_needs_restore(remote_snapshot: dict[str, object], local_snapshot: dict[str, object]) -> bool:
     if snapshot_weight(remote_snapshot) < snapshot_weight(local_snapshot):
         return True
-    critical_sections = ["telegram_users", "memory_cells", "timed_memories"]
     return any(
         snapshot_section_count(local_snapshot, section) > 0
         and snapshot_section_count(remote_snapshot, section) == 0
-        for section in critical_sections
+        for section in CRITICAL_SECTIONS
     )
+
+
+def merge_critical_sections_for_restore(
+    restore_snapshot: dict[str, object],
+    remote_snapshot: dict[str, object],
+) -> dict[str, object]:
+    merged = dict(restore_snapshot)
+    for section in CRITICAL_SECTIONS:
+        restore_items = restore_snapshot.get(section)
+        remote_items = remote_snapshot.get(section)
+        if isinstance(remote_items, list) and remote_items and not (
+            isinstance(restore_items, list) and restore_items
+        ):
+            merged[section] = remote_items
+    return merged
 
 
 def load_backup_snapshot(path: Path) -> dict[str, object]:
@@ -153,7 +168,8 @@ def sync_backup(url: str, token: str, client_id: str, backup_dir: Path, keep: in
     if latest is not None:
         local_snapshot = load_backup_snapshot(latest)
         if snapshot_needs_restore(snapshot, local_snapshot):
-            restore_backup(url, token, client_id, latest)
+            restore_snapshot = merge_critical_sections_for_restore(local_snapshot, snapshot)
+            import_snapshot(url, token, client_id, restore_snapshot)
             return "restored", latest
 
     path = save_backup(backup_dir, client_id, snapshot)
@@ -163,6 +179,14 @@ def sync_backup(url: str, token: str, client_id: str, backup_dir: Path, keep: in
 
 def restore_backup(url: str, token: str, client_id: str, backup_path: Path) -> dict[str, object]:
     snapshot = load_backup_snapshot(backup_path)
+    remote_data = request_snapshot(url, token, {"action": "export", "client_id": client_id})
+    remote_snapshot = remote_data.get("snapshot")
+    if isinstance(remote_snapshot, dict):
+        snapshot = merge_critical_sections_for_restore(snapshot, remote_snapshot)
+    return import_snapshot(url, token, client_id, snapshot)
+
+
+def import_snapshot(url: str, token: str, client_id: str, snapshot: dict[str, object]) -> dict[str, object]:
     return request_snapshot(url, token, {"action": "import", "client_id": client_id, "snapshot": snapshot})
 
 

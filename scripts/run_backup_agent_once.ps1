@@ -13,4 +13,11 @@ if (Test-Path -LiteralPath $venvPython) {
     $pythonExe = "py"
     $arguments = @("backup_agent.py", "once")
 }
-Start-Process -FilePath $pythonExe -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog | Out-Null
+for ($attempt = 1; $attempt -le 12; $attempt++) {
+    $time = Get-Date -Format "s"
+    Add-Content -LiteralPath $outLog -Value "[$time] post-commit backup attempt $attempt"
+    & $pythonExe @arguments 1>> $outLog 2>> $errLog
+    if ($attempt -lt 12) {
+        Start-Sleep -Seconds 10
+    }
+}
