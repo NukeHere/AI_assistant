@@ -501,7 +501,20 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         model_mode=model_mode,
         telegram_action=telegram_action,
     )
-    audit_event("message_handled", client_id=client_id, conversation_id=conversation_id, channel=channel, persona=active_persona.value, model_mode=model_mode, memory_saved=saved, memory_recalled=recalled, timed_memory_saved=timed_saved, telegram_action=bool(telegram_action), response_preview=answer)
+    audit_event(
+        "message_handled",
+        client_id=client_id,
+        conversation_id=conversation_id,
+        channel=channel,
+        persona=active_persona.value,
+        model_mode=model_mode,
+        memory_saved=saved,
+        memory_recalled=recalled,
+        timed_memory_saved=timed_saved,
+        telegram_action=bool(telegram_action),
+        telegram_action_details=telegram_action_audit_details(telegram_action),
+        response_preview=answer,
+    )
     return payload
 def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if not TG_BOT_API_KEY:
@@ -650,6 +663,11 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         memory_recalled=payload.get("memory_recalled"),
         timed_memory_saved=payload.get("timed_memory_saved"),
         telegram_route=route_result.get("telegram_route"),
+        telegram_group_sent=route_result.get("telegram_group_sent"),
+        telegram_private_sent=route_result.get("telegram_private_sent"),
+        telegram_reaction_sent=route_result.get("telegram_reaction_sent"),
+        telegram_text_suppressed=route_result.get("telegram_text_suppressed"),
+        telegram_action_details=route_result.get("telegram_action_details"),
         text_preview=text,
         response_preview=payload.get("text"),
     )
@@ -940,6 +958,22 @@ def telegram_sender_mention_text(user: dict[str, object]) -> str:
     return name or "пользователь"
 
 
+def telegram_action_audit_details(action: dict[str, object] | None) -> dict[str, object]:
+    if not action:
+        return {}
+    return {
+        "reply_to": str(action.get("reply_to") or "group"),
+        "mention_sender": bool(action.get("mention_sender")),
+        "group_text_preview": text_preview(action.get("group_text")),
+        "private_text_preview": text_preview(action.get("private_text")),
+        "private_to_username": str(action.get("private_to_username") or ""),
+        "private_to_telegram_user_id": str(action.get("private_to_telegram_user_id") or ""),
+        "reaction_emoji": str(action.get("reaction_emoji") or ""),
+        "group_text_explicit": bool(action.get("group_text_explicit")),
+        "private_text_explicit": bool(action.get("private_text_explicit")),
+    }
+
+
 def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[str, object], chat_type: str, payload: dict[str, object], message_id: object | None = None) -> dict[str, object]:
     answer = str(payload.get("text") or "")
     action = sanitize_telegram_action(payload.get("telegram_action")) or {"reply_to": "group", "mention_sender": False, "group_text": "", "private_text": "", "reaction_emoji": ""}
@@ -952,9 +986,19 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     private_text_explicit = bool(action.get("private_text_explicit"))
     reaction_only = bool(reaction_emoji) and reply_to != "both" and not group_text_explicit and not private_text_explicit
     if chat_type == "private":
+        private_text_to_send = str(action.get("private_text") or answer)
         if not reaction_only:
-            send_telegram_message(chat_id, str(action.get("private_text") or answer))
-        return {"telegram_route": "reaction" if reaction_only else "private", "telegram_reaction_sent": reaction_sent, "telegram_text_suppressed": reaction_only}
+            send_telegram_message(chat_id, private_text_to_send)
+        return {
+            "telegram_route": "reaction" if reaction_only else "private",
+            "telegram_reaction_sent": reaction_sent,
+            "telegram_text_suppressed": reaction_only,
+            "telegram_action_details": {
+                **telegram_action_audit_details(action),
+                "sent_private_text_preview": "" if reaction_only else text_preview(private_text_to_send),
+                "sent_private_to": str(chat_id),
+            },
+        }
 
     group_text = str(action.get("group_text") or "").strip()
     private_text = str(action.get("private_text") or "").strip()
@@ -972,17 +1016,37 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     if reply_to in {"group", "both"} and group_text:
         send_telegram_message(chat_id, group_text)
         sent_group = True
+    private_chat_id = ""
+    unknown_recipient = ""
+    fallback_text = ""
     if reply_to in {"private", "both"} and private_text:
-        private_chat_id, unknown_recipient = resolve_private_telegram_recipient(action, telegram_user_id)
-        if private_chat_id:
-            sent_private = try_send_telegram_message(private_chat_id, private_text)
+        resolved_private_chat_id, resolved_unknown_recipient = resolve_private_telegram_recipient(action, telegram_user_id)
+        private_chat_id = str(resolved_private_chat_id or "")
+        unknown_recipient = str(resolved_unknown_recipient or "")
+        if resolved_private_chat_id:
+            sent_private = try_send_telegram_message(resolved_private_chat_id, private_text)
         if not sent_private and not sent_group:
             if unknown_recipient:
-                send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, я пока не знаю Telegram chat_id получателя {unknown_recipient}. Пусть он напишет мне /start, потом повтори запрос.")
+                fallback_text = f"{telegram_sender_mention_text(user)}, я пока не знаю Telegram chat_id получателя {unknown_recipient}. Пусть он напишет мне /start, потом повтори запрос."
             else:
-                send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Пользователь должен сначала написать мне /start в личном чате.")
+                fallback_text = f"{telegram_sender_mention_text(user)}, не смог написать в личку. Пользователь должен сначала написать мне /start в личном чате."
+            send_telegram_message(chat_id, fallback_text)
             sent_group = True
-    return {"telegram_route": "reaction" if reaction_only else reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private, "telegram_reaction_sent": reaction_sent, "telegram_text_suppressed": reaction_only}
+    return {
+        "telegram_route": "reaction" if reaction_only else reply_to,
+        "telegram_group_sent": sent_group,
+        "telegram_private_sent": sent_private,
+        "telegram_reaction_sent": reaction_sent,
+        "telegram_text_suppressed": reaction_only,
+        "telegram_action_details": {
+            **telegram_action_audit_details(action),
+            "sent_group_text_preview": text_preview(group_text),
+            "sent_private_text_preview": text_preview(private_text),
+            "sent_private_to": private_chat_id,
+            "unknown_private_recipient": unknown_recipient,
+            "fallback_group_text_preview": text_preview(fallback_text),
+        },
+    }
 
 
 

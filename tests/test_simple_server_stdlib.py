@@ -718,6 +718,9 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(response["telegram_route"], "private")
         self.assertTrue(response["telegram_private_sent"])
         self.assertEqual(sent[-1], ("888", "бздын"))
+        self.assertEqual(response["telegram_action_details"]["private_to_username"], "goldgooner")
+        self.assertEqual(response["telegram_action_details"]["sent_private_to"], "888")
+        self.assertEqual(response["telegram_action_details"]["sent_private_text_preview"], "бздын")
 
     def test_telegram_action_private_unknown_username_does_not_send_to_requester(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
