@@ -776,7 +776,7 @@ def is_telegram_relevant_for_assistant(text: str) -> bool:
         return True
     phrases = [
         "как", "что", "почему", "зачем", "когда", "где", "можешь", "сможешь", "помоги",
-        "сделай", "проверь", "объясни", "скажи", "напомни", "запомни", "память",
+        "сделай", "поставь", "проверь", "объясни", "скажи", "напомни", "запомни", "память", "реакция", "реакцию",
         "ошибка", "не работает", "сломалось", "баг", "секретарь", "ассистент", "ана", "анна",
         "anna", "alien", "бот", "bot",
     ]
@@ -819,6 +819,8 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
         "group_text": group_text[:2000],
         "private_text": private_text[:3800],
         "reaction_emoji": reaction_emoji[:16],
+        "group_text_explicit": bool(group_text),
+        "private_text_explicit": bool(private_text),
     }
 
 
@@ -847,7 +849,8 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
             "reply_to=group для компактного публичного ответа, reply_to=private для конфиденциальных/персональных данных, "
             "reply_to=both для короткой групповой реплики и более полного личного сообщения. "
             "Используй mention_sender=true, когда обращаешься к отправителю в группе. "
-            "Если достаточно реакции вместо ответа, добавь reaction_emoji, например 👍 или 👀."
+            "Если достаточно реакции вместо ответа, добавь reaction_emoji, например 👍 или 👀, и не дублируй это текстом. "
+            "Текст вместе с реакцией отправляй только когда он явно нужен."
         )
     return "\n".join(lines)
 
@@ -867,15 +870,21 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     reaction_emoji = str(action.get("reaction_emoji") or "").strip()
     if reaction_emoji and message_id is not None:
         reaction_sent = try_set_telegram_reaction(chat_id, message_id, reaction_emoji)
-    if chat_type == "private":
-        send_telegram_message(chat_id, str(action.get("private_text") or answer))
-        return {"telegram_route": "private", "telegram_reaction_sent": reaction_sent}
-
     reply_to = str(action.get("reply_to") or "group")
+    group_text_explicit = bool(action.get("group_text_explicit"))
+    private_text_explicit = bool(action.get("private_text_explicit"))
+    reaction_only = bool(reaction_emoji) and reply_to != "both" and not group_text_explicit and not private_text_explicit
+    if chat_type == "private":
+        if not reaction_only:
+            send_telegram_message(chat_id, str(action.get("private_text") or answer))
+        return {"telegram_route": "reaction" if reaction_only else "private", "telegram_reaction_sent": reaction_sent, "telegram_text_suppressed": reaction_only}
+
     group_text = str(action.get("group_text") or "").strip()
-    private_text = str(action.get("private_text") or "").strip() or answer
-    if reply_to in {"group", "both"} and not group_text:
+    private_text = str(action.get("private_text") or "").strip()
+    if reply_to in {"group", "both"} and not group_text and not reaction_only:
         group_text = answer
+    if reply_to in {"private", "both"} and not private_text:
+        private_text = answer
     if group_text and bool(action.get("mention_sender")):
         mention = telegram_sender_mention_text(user)
         if mention not in group_text:
@@ -891,7 +900,7 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
         if not sent_private and not sent_group:
             send_telegram_message(chat_id, f"{telegram_sender_mention_text(user)}, не смог написать в личку. Напиши мне /start в личном чате и повтори запрос.")
             sent_group = True
-    return {"telegram_route": reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private, "telegram_reaction_sent": reaction_sent}
+    return {"telegram_route": "reaction" if reaction_only else reply_to, "telegram_group_sent": sent_group, "telegram_private_sent": sent_private, "telegram_reaction_sent": reaction_sent, "telegram_text_suppressed": reaction_only}
 
 
 def try_send_telegram_message(chat_id: object, text: str) -> bool:

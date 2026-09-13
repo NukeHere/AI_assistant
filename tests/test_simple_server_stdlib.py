@@ -618,6 +618,49 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(sent[-1][0], 555)
         self.assertIn("@telegram_user", sent[-1][1])
 
+    def test_telegram_reaction_action_suppresses_default_text(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_react = simple_server.set_telegram_reaction
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+        reactions: list[tuple[object, object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_react(chat_id: object, message_id: object, emoji: str) -> None:
+            reactions.append((chat_id, message_id, emoji))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                "Я поставлю реакцию.\n"
+                "```assistant_memory\n"
+                '{"telegram_action":{"reply_to":"group","reaction_emoji":"👍"}}\n'
+                "```",
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.set_telegram_reaction = fake_react
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("поставь реакцию", chat_type="group", message_id=77))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.set_telegram_reaction = old_react
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "reaction")
+        self.assertTrue(response["telegram_reaction_sent"])
+        self.assertTrue(response["telegram_text_suppressed"])
+        self.assertEqual(reactions, [(555, 77, "👍")])
+        self.assertEqual(len(sent), 1)
+
     def test_telegram_message_html_removes_raw_markdown(self) -> None:
         rendered = simple_server.telegram_message_html("**Наблюдение:** Всё нормально\n**Итог:** Готово")
 

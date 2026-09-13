@@ -75,6 +75,22 @@ def snapshot_weight(snapshot: dict[str, object]) -> int:
     )
 
 
+def snapshot_section_count(snapshot: dict[str, object], section: str) -> int:
+    value = snapshot.get(section, [])
+    return len(value) if isinstance(value, list) else 0
+
+
+def snapshot_needs_restore(remote_snapshot: dict[str, object], local_snapshot: dict[str, object]) -> bool:
+    if snapshot_weight(remote_snapshot) < snapshot_weight(local_snapshot):
+        return True
+    critical_sections = ["telegram_users", "memory_cells", "timed_memories"]
+    return any(
+        snapshot_section_count(local_snapshot, section) > 0
+        and snapshot_section_count(remote_snapshot, section) == 0
+        for section in critical_sections
+    )
+
+
 def load_backup_snapshot(path: Path) -> dict[str, object]:
     snapshot = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(snapshot, dict):
@@ -136,7 +152,7 @@ def sync_backup(url: str, token: str, client_id: str, backup_dir: Path, keep: in
     latest = latest_backup(backup_dir, client_id)
     if latest is not None:
         local_snapshot = load_backup_snapshot(latest)
-        if snapshot_weight(snapshot) < snapshot_weight(local_snapshot):
+        if snapshot_needs_restore(snapshot, local_snapshot):
             restore_backup(url, token, client_id, latest)
             return "restored", latest
 
