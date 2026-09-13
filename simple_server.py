@@ -542,7 +542,11 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         last_name=str(sender.get("last_name") or ""),
         is_bot=is_bot,
     )
-    command_text = normalize_telegram_command(text)
+    telegram_command = parse_telegram_command(text)
+    is_own_command = is_telegram_command_for_this_bot(telegram_command, chat_type)
+    command_name = str(telegram_command.get("command") or "") if is_own_command else ""
+    command_args = str(telegram_command.get("args") or "") if is_own_command else ""
+    command_text = normalize_telegram_command(text) if is_own_command or telegram_command is None else text.strip()
     linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id)
     audit_event(
         "telegram_received",
@@ -563,6 +567,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         is_authorized=is_authorized,
         addressed=addressed,
         reply_to_bot=reply_to_bot,
+        is_own_command=is_own_command,
     )
     if not should_process:
         audit_event(
@@ -579,31 +584,31 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         )
         return {"ok": True, "ignored": True, "reason": decision_reason, "participation_mode": participation_mode}
 
-    if command_text.startswith("/start"):
+    if command_name == "start":
         reply = telegram_start_text(user, linked_client_id, is_authorized)
         send_telegram_message(chat_id, reply)
         audit_event("telegram_command", command="start", chat_id=chat_id, telegram_user_id=telegram_user_id, response_preview=reply)
         return {"ok": True, "handled": "start"}
-    if command_text.startswith("/link"):
-        parts = command_text.split(maxsplit=1)
-        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9_.-]{3,128}", parts[1].strip()):
+    if command_name == "link":
+        app_client_id = command_args.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,128}", app_client_id):
             reply = "Пришли app client_id так: /link primary-user. В приложении его можно узнать командой /id."
             send_telegram_message(chat_id, reply)
             audit_event("telegram_command", command="link_help", chat_id=chat_id, telegram_user_id=telegram_user_id, response_preview=reply)
             return {"ok": True, "handled": "link_help"}
-        linked = storage.link_telegram_user(telegram_user_id, parts[1].strip())
+        linked = storage.link_telegram_user(telegram_user_id, app_client_id)
         migrated = migrate_guest_memories(str(linked.get("guest_client_id") or ""), str(linked.get("app_client_id") or ""))
         reply = f"Готово. Telegram привязан к app client_id: {linked['app_client_id']}. Перенесено guest-memory: {migrated}."
         send_telegram_message(chat_id, reply)
         audit_event("telegram_command", command="linked", chat_id=chat_id, telegram_user_id=telegram_user_id, app_client_id=linked.get("app_client_id"), migrated_memories=migrated, response_preview=reply)
         return {"ok": True, "handled": "linked", "migrated_memories": migrated}
-    if command_text.startswith("/unlink"):
+    if command_name == "unlink":
         storage.unlink_telegram_user(telegram_user_id)
         reply = "Привязка Telegram отключена. Дальше будет гостевой режим."
         send_telegram_message(chat_id, reply)
         audit_event("telegram_command", command="unlinked", chat_id=chat_id, telegram_user_id=telegram_user_id, response_preview=reply)
         return {"ok": True, "handled": "unlinked"}
-    if command_text.startswith("/whoami") or command_text.startswith("/id"):
+    if command_name in {"whoami", "id"}:
         app_id = linked_client_id
         state = "authorized" if is_authorized else "guest"
         safe_username = user.get("username") or "-"
@@ -707,10 +712,43 @@ def telegram_reaction_emojis(reactions: object) -> list[str]:
             emojis.append("custom_emoji:" + str(reaction.get("custom_emoji_id")))
     return emojis
 
+TELEGRAM_COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]{1,64})(?:@([A-Za-z0-9_]{1,64}))?(?:\s+(.*))?$", re.DOTALL)
+
+
+def telegram_known_bot_usernames() -> set[str]:
+    return {name.lower() for name in [TG_BOT_USERNAME, "VBDsThirdSon_bot"] if name}
+
+
+def parse_telegram_command(text: str) -> dict[str, str] | None:
+    match = TELEGRAM_COMMAND_RE.match(text.strip())
+    if not match:
+        return None
+    command, target_username, args = match.groups()
+    return {
+        "command": command.lower(),
+        "target_username": (target_username or "").lstrip("@").lower(),
+        "args": (args or "").strip(),
+    }
+
+
+def is_telegram_command_for_this_bot(command: dict[str, str] | None, chat_type: str) -> bool:
+    if command is None:
+        return False
+    target_username = command.get("target_username") or ""
+    if target_username:
+        return target_username in telegram_known_bot_usernames()
+    return chat_type == "private"
+
+
 def normalize_telegram_command(text: str) -> str:
     stripped = text.strip()
+    command = parse_telegram_command(stripped)
+    if command and is_telegram_command_for_this_bot(command, "private"):
+        normalized = "/" + command["command"]
+        if command["args"]:
+            normalized += " " + command["args"]
+        return normalized
     if TG_BOT_USERNAME:
-        stripped = re.sub(rf"^(/\w+)@{re.escape(TG_BOT_USERNAME)}\b", r"\1", stripped, flags=re.IGNORECASE)
         stripped = re.sub(rf"@{re.escape(TG_BOT_USERNAME)}\b", "", stripped, flags=re.IGNORECASE).strip()
     return stripped
 
@@ -725,6 +763,7 @@ def should_ignore_telegram_message(text: str, chat_type: str, is_authorized: boo
         addressed=was_addressed,
         reply_to_bot=False,
         update_state=False,
+        is_own_command=is_telegram_command_for_this_bot(parse_telegram_command(text), chat_type),
     )
     return not should_process
 
@@ -738,10 +777,11 @@ def telegram_participation_decision(
     addressed: bool,
     reply_to_bot: bool,
     update_state: bool = True,
+    is_own_command: bool = False,
 ) -> tuple[bool, str, str]:
     if not TG_SECRETARY_MODE:
         return True, "secretary_disabled", "full"
-    if text.startswith("/"):
+    if is_own_command:
         return True, "command", "command"
     if chat_type == "private":
         return True, "private_chat", "full"
@@ -1201,7 +1241,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": f"Telegram request failed: {error}"}, status=502)
             return
 
-        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync", "/v1/logs"}:
+        if self.path not in {"/v1/chat/simple", "/v1/message", "/v1/history", "/v1/snapshot", "/v1/sync", "/v1/logs", "/v1/client/register"}:
             self.send_json({"error": "Not found"}, status=404)
             return
         if not self.authorized():

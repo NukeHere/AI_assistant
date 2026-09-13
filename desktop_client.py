@@ -104,6 +104,7 @@ class ChatApp(tk.Tk):
         self.client_id_var = tk.StringVar(value=CLIENT_ID)
         self.client_id_entry = tk.Entry(id_row, textvariable=self.client_id_var)
         self.client_id_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+        self._bind_entry_shortcuts(self.client_id_entry)
         tk.Button(id_row, text="Сохранить ID", command=self._save_client_id_from_ui).pack(side=tk.RIGHT)
 
         self.history = scrolledtext.ScrolledText(self, wrap=tk.WORD, state=tk.DISABLED)
@@ -393,6 +394,33 @@ class ChatApp(tk.Tk):
         self.input.mark_set(tk.INSERT, "1.0")
         self.input.see(tk.INSERT)
         return "break"
+    def _bind_entry_shortcuts(self, entry: tk.Entry) -> None:
+        for sequence in ("<Control-c>", "<Control-C>"):
+            entry.bind(sequence, self._entry_copy)
+        for sequence in ("<Control-v>", "<Control-V>"):
+            entry.bind(sequence, self._entry_paste)
+        for sequence in ("<Control-x>", "<Control-X>"):
+            entry.bind(sequence, self._entry_cut)
+        for sequence in ("<Control-a>", "<Control-A>"):
+            entry.bind(sequence, self._entry_select_all)
+
+    def _entry_copy(self, event: tk.Event) -> str:
+        event.widget.event_generate("<<Copy>>")
+        return "break"
+
+    def _entry_paste(self, event: tk.Event) -> str:
+        event.widget.event_generate("<<Paste>>")
+        return "break"
+
+    def _entry_cut(self, event: tk.Event) -> str:
+        event.widget.event_generate("<<Cut>>")
+        return "break"
+
+    def _entry_select_all(self, event: tk.Event) -> str:
+        event.widget.selection_range(0, tk.END)
+        event.widget.icursor(tk.END)
+        return "break"
+
     def _show_history_menu(self, event: tk.Event) -> str:
         try:
             self.history_menu.tk_popup(event.x_root, event.y_root)

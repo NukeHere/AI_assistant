@@ -410,6 +410,59 @@ class SimpleServerTests(unittest.TestCase):
         self.assertTrue(response["authorized"])
         self.assertTrue(sent)
 
+    def test_telegram_group_command_with_own_bot_suffix_switches_persona(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_username = simple_server.TG_BOT_USERNAME
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.TG_BOT_USERNAME = "VBDsThirdSon_bot"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(telegram_update("/alien@VBDsThirdSon_bot", chat_type="group"))
+                history = handle_history_request({"client_id": "primary-user", "conversation_id": "default", "limit": 5})
+                persona = simple_server.storage.ensure_conversation("primary-user", "default")["persona"]
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.TG_BOT_USERNAME = old_username
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(response["handled"], "message")
+        self.assertEqual(response.get("participation_mode"), "command")
+        self.assertEqual(persona, "ALIEN")
+        self.assertTrue(any(item["role"] == "user" and item["content"] == "/alien" for item in history["messages"]))
+        self.assertTrue(sent)
+
+    def test_telegram_group_command_for_other_bot_is_not_our_command(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_username = simple_server.TG_BOT_USERNAME
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.TG_BOT_USERNAME = "VBDsThirdSon_bot"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                response = simple_server.handle_telegram_update(telegram_update("/banana@TalcBotByVBDbot", chat_type="group"))
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.TG_BOT_USERNAME = old_username
+            simple_server.send_telegram_message = old_send
+
+        self.assertTrue(response["ignored"])
+        self.assertEqual(response["reason"], "guest_group_chatter")
+        self.assertFalse(sent)
+
     def test_telegram_secretary_allows_guest_group_direct_mention(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
         old_send = simple_server.send_telegram_message
