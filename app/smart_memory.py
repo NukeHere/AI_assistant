@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 MEMORY_BLOCK_RE = re.compile(r"```assistant_memory\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9_]{3,}")
+DIRECTIVE_KEYS = {"remember", "recall", "timers", "schedule", "persona", "mode", "telegram_action", "telegram"}
 
 MEMORY_DIRECTIVE_PROMPT = """
 Функции умной памяти доступны через приватный управляющий блок.
@@ -85,34 +87,57 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
     persona: str | None = None
     telegram_action: dict[str, Any] | None = None
 
-    def consume(match: re.Match[str]) -> str:
+    def consume_payload(payload: object) -> bool:
         nonlocal remember, recall, persona, telegram_action
+        if not isinstance(payload, dict) or not (DIRECTIVE_KEYS & set(payload)):
+            return False
+        raw_remember = payload.get("remember", [])
+        if isinstance(raw_remember, list):
+            remember.extend(item for item in raw_remember if isinstance(item, dict))
+        raw_recall = payload.get("recall", [])
+        if isinstance(raw_recall, list):
+            recall.extend(str(item).strip() for item in raw_recall if str(item).strip())
+        elif isinstance(raw_recall, str) and raw_recall.strip():
+            recall.append(raw_recall.strip())
+        raw_timers = payload.get("timers", payload.get("schedule", []))
+        if isinstance(raw_timers, list):
+            timers.extend(item for item in raw_timers if isinstance(item, dict))
+        raw_persona = str(payload.get("persona") or payload.get("mode") or "").strip().upper()
+        if raw_persona in {"ANA", "ALIEN"}:
+            persona = raw_persona
+        raw_telegram = payload.get("telegram_action", payload.get("telegram"))
+        if isinstance(raw_telegram, dict):
+            telegram_action = raw_telegram
+        return True
+
+    def consume(match: re.Match[str]) -> str:
         try:
             payload = json.loads(match.group(1))
         except json.JSONDecodeError:
             return ""
-        if isinstance(payload, dict):
-            raw_remember = payload.get("remember", [])
-            if isinstance(raw_remember, list):
-                remember.extend(item for item in raw_remember if isinstance(item, dict))
-            raw_recall = payload.get("recall", [])
-            if isinstance(raw_recall, list):
-                recall.extend(str(item).strip() for item in raw_recall if str(item).strip())
-            elif isinstance(raw_recall, str) and raw_recall.strip():
-                recall.append(raw_recall.strip())
-            raw_timers = payload.get("timers", payload.get("schedule", []))
-            if isinstance(raw_timers, list):
-                timers.extend(item for item in raw_timers if isinstance(item, dict))
-            raw_persona = str(payload.get("persona") or payload.get("mode") or "").strip().upper()
-            if raw_persona in {"ANA", "ALIEN"}:
-                persona = raw_persona
-            raw_telegram = payload.get("telegram_action", payload.get("telegram"))
-            if isinstance(raw_telegram, dict):
-                telegram_action = raw_telegram
+        consume_payload(payload)
         return ""
 
     cleaned = MEMORY_BLOCK_RE.sub(consume, text).strip()
+    cleaned = JSON_BLOCK_RE.sub(
+        lambda match: "" if _consume_json_match(match, consume_payload) else match.group(0),
+        cleaned,
+    ).strip()
+    try:
+        standalone_payload = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        standalone_payload = None
+    if consume_payload(standalone_payload):
+        cleaned = ""
     return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona, telegram_action=telegram_action)
+
+
+def _consume_json_match(match: re.Match[str], consume_payload: Any) -> bool:
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return False
+    return bool(consume_payload(payload))
 
 
 def sanitize_memory_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

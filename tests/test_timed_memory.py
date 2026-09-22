@@ -9,6 +9,24 @@ from simple_server import handle_message_request, handle_sync_request
 
 
 class TimedMemoryTests(unittest.TestCase):
+    def test_raw_telegram_action_json_is_private_directive(self) -> None:
+        cleaned, directive = extract_memory_directive(
+            '{"telegram_action":{"reply_to":"group","mention_sender":true,'
+            '"group_text":"Помогаю отвечать на вопросы и выполнять задачи. Чем могу быть полезен?"}}'
+        )
+
+        self.assertEqual(cleaned, "")
+        self.assertIsNotNone(directive.telegram_action)
+        self.assertEqual(directive.telegram_action["reply_to"], "group")
+        self.assertTrue(directive.telegram_action["mention_sender"])
+
+    def test_visible_json_without_directive_keys_is_not_removed(self) -> None:
+        source = '{"example":"обычный JSON для пользователя"}'
+        cleaned, directive = extract_memory_directive(source)
+
+        self.assertEqual(cleaned, source)
+        self.assertIsNone(directive.telegram_action)
+
     def test_memory_directive_parses_timers(self) -> None:
         cleaned, directive = extract_memory_directive(
             'Готово.\n```assistant_memory\n'
@@ -88,6 +106,39 @@ class TimedMemoryTests(unittest.TestCase):
             simple_server.send_telegram_message = old_send
 
         self.assertEqual(sent, [("777", "⏰ Напоминание: помидор\nВспомнить слово помидор")])
+
+    def test_background_scan_sends_due_timed_memory_to_telegram(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        try:
+            with isolated_storage():
+                simple_server.storage.upsert_telegram_user("777", username="telegram_user")
+                simple_server.storage.link_telegram_user("777", "primary-user")
+                simple_server.storage.add_timed_memory(
+                    "primary-user",
+                    "background-timer-test",
+                    "фоновое напоминание",
+                    "Отправить сообщение без запроса клиента",
+                    "2000-01-01T00:00:00Z",
+                )
+
+                materialized = simple_server.process_due_timed_memories_once()
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+
+        self.assertEqual(materialized, 1)
+        self.assertEqual(
+            sent,
+            [("777", "⏰ Напоминание: фоновое напоминание\nОтправить сообщение без запроса клиента")],
+        )
 
     def test_snapshot_roundtrip_keeps_timed_memories(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:

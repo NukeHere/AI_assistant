@@ -16,7 +16,11 @@ The server strips this block from the user-visible answer and stores it in `time
 
 ## What happens when time arrives
 
-On message/history/sync activity the server checks due timers. Due timers are marked triggered and materialized as system messages in the conversation event stream. This avoids spending tokens while waiting.
+The server checks due timers in a lightweight background loop (every 5 seconds by default) and also during message/history/sync activity. Due timers are marked triggered and materialized as system messages in the conversation event stream. No model request or tokens are needed while waiting.
+
+If the app client is linked to one or more authorized Telegram users, each due timer is also sent to them as a private Telegram message. Configure the interval with `TIMED_MEMORY_POLL_SECONDS`; set it to `0` to disable the background loop.
+
+Render free services can be suspended while inactive. Code inside a suspended service cannot wake itself, so exact-time reminders require an always-awake service or an external scheduler that periodically wakes the web service.
 
 ## Commands
 

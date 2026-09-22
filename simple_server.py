@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from threading import Event, Thread
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +55,7 @@ TG_AUTHORIZED_SAMPLE_EVERY = max(0, int(os.getenv("TG_AUTHORIZED_SAMPLE_EVERY", 
 TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_SECRETARY_MODE = os.getenv("TG_SECRETARY_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_BOT_TO_BOT = os.getenv("TG_BOT_TO_BOT", "true").lower() not in {"0", "false", "no", "off"}
+TIMED_MEMORY_POLL_SECONDS = max(0.0, float(os.getenv("TIMED_MEMORY_POLL_SECONDS", "5")))
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
 TELEGRAM_GROUP_STATE: dict[str, dict[str, object]] = {}
@@ -132,6 +134,45 @@ def notify_telegram_timed_memories(client_id: str, due_rows: list[dict[str, obje
                 text_preview=text,
             )
 
+
+
+def process_due_timed_memories_once() -> int:
+    now_utc, _ = current_times()
+    materialized = 0
+    for scope in storage.due_timed_memory_scopes(now_utc):
+        materialized += len(materialize_due(scope["client_id"], scope["conversation_id"]))
+    if materialized:
+        audit_event("timed_memory_scan_completed", materialized=materialized)
+    return materialized
+
+
+def timed_memory_scheduler_loop(stop_event: Event) -> None:
+    audit_event("timed_memory_scheduler_started", poll_seconds=TIMED_MEMORY_POLL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            process_due_timed_memories_once()
+        except Exception as error:
+            audit_event(
+                "timed_memory_scheduler_failed",
+                error_type=type(error).__name__,
+                error_preview=str(error),
+            )
+        stop_event.wait(TIMED_MEMORY_POLL_SECONDS)
+
+
+def start_timed_memory_scheduler() -> tuple[Event, Thread | None]:
+    stop_event = Event()
+    if TIMED_MEMORY_POLL_SECONDS <= 0:
+        audit_event("timed_memory_scheduler_disabled")
+        return stop_event, None
+    thread = Thread(
+        target=timed_memory_scheduler_loop,
+        args=(stop_event,),
+        name="timed-memory-scheduler",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def clean_client_id(value: object) -> str:
@@ -1329,6 +1370,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "smart_memory": True,
                 "render_blocks": True,
                 "timed_memory": True,
+                "timed_memory_poll_seconds": TIMED_MEMORY_POLL_SECONDS,
                 "telegram_webhook": bool(TG_BOT_API_KEY),
                 "server_time_utc": current_times()[0],
                 "server_timezone": ASSISTANT_TIMEZONE,
@@ -1440,10 +1482,15 @@ class AssistantHandler(BaseHTTPRequestHandler):
 def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
+    scheduler_stop, _ = start_timed_memory_scheduler()
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
     print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/client/register, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        scheduler_stop.set()
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -452,6 +452,28 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def due_timed_memory_scopes(self, now_utc: str, limit: int = 100) -> list[dict[str, str]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                select client_id, conversation_id, min(due_at) as next_due_at
+                  from timed_memories
+                 where status = 'scheduled' and due_at <= ?
+                 group by client_id, conversation_id
+                 order by next_due_at asc
+                 limit ?
+                """,
+                (now_utc, limit),
+            ).fetchall()
+        return [
+            {
+                "client_id": str(row["client_id"]),
+                "conversation_id": str(row["conversation_id"]),
+                "next_due_at": str(row["next_due_at"]),
+            }
+            for row in rows
+        ]
+
     def materialize_due_timed_memories(self, client_id: str, conversation_id: str, now_utc: str) -> list[dict[str, Any]]:
         self.ensure_conversation(client_id, conversation_id)
         with self._lock, self._connect() as conn:

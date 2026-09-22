@@ -612,6 +612,41 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(directive.telegram_action["reply_to"], "private")
         self.assertTrue(directive.telegram_action["mention_sender"])
 
+    def test_raw_telegram_action_json_is_routed_without_leaking_json(self) -> None:
+        old_key = simple_server.TG_BOT_API_KEY
+        old_send = simple_server.send_telegram_message
+        old_complete = simple_server.complete
+        sent: list[tuple[object, str]] = []
+
+        def fake_send(chat_id: object, text: str) -> None:
+            sent.append((chat_id, text))
+
+        def fake_complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+            return (
+                '{"telegram_action":{"reply_to":"group","mention_sender":true,'
+                '"group_text":"Помогаю отвечать на вопросы и выполнять задачи. Чем могу быть полезен?"}}',
+                "mock",
+            )
+
+        simple_server.TG_BOT_API_KEY = "test-token"
+        simple_server.send_telegram_message = fake_send
+        simple_server.complete = fake_complete
+        try:
+            with isolated_storage():
+                simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                response = simple_server.handle_telegram_update(
+                    telegram_update("бот, что ты умеешь?", chat_type="group")
+                )
+        finally:
+            simple_server.TG_BOT_API_KEY = old_key
+            simple_server.send_telegram_message = old_send
+            simple_server.complete = old_complete
+
+        self.assertEqual(response["telegram_route"], "group")
+        self.assertTrue(response["telegram_group_sent"])
+        self.assertNotIn("telegram_action", sent[-1][1])
+        self.assertIn("Помогаю отвечать", sent[-1][1])
+
     def test_telegram_action_can_move_group_answer_to_private(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
         old_send = simple_server.send_telegram_message
