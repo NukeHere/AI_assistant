@@ -128,6 +128,23 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
         lambda match: "" if _consume_json_match(match, consume_payload) else match.group(0),
         cleaned,
     ).strip()
+    # Некоторые модели забывают fenced-блок: marker + JSON всё ещё приватный вызов.
+    # raw_decode учитывает вложенные объекты и скобки внутри строк.
+    decoder = json.JSONDecoder()
+    marker = re.compile(r"(?<![\w])assistant_memory\b\s*:?\s*(?=\{)", re.IGNORECASE)
+    offset = 0
+    while match := marker.search(cleaned, offset):
+        try:
+            payload, length = decoder.raw_decode(cleaned[match.end():])
+        except json.JSONDecodeError:
+            # Оборванный служебный хвост не показываем и не исполняем.
+            cleaned = cleaned[:match.start()].rstrip()
+            break
+        end = match.end() + length
+        consume_payload(payload)
+        cleaned = cleaned[:match.start()] + cleaned[end:]
+        offset = match.start()
+    cleaned = cleaned.strip()
     try:
         standalone_payload = json.loads(cleaned)
     except (json.JSONDecodeError, TypeError):

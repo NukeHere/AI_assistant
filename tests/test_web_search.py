@@ -10,6 +10,28 @@ from tests.test_simple_server_stdlib import isolated_storage
 
 
 class SearchTests(unittest.TestCase):
+    def test_unfenced_search_runs_instead_of_leaking_to_user(self):
+        raw = 'We\'ll request web search.assistant_memory\n{\n"web_search": {"query": "последние новости науки"}\n}'
+        with isolated_storage(), patch.object(server, 'complete', side_effect=[(raw, 'mock'), ('Вот результат поиска.', 'mock')]), patch.object(server, 'tavily_search', return_value={'results': []}) as search:
+            result = server.complete_with_smart_memory('test', 'test', [{'role': 'user', 'content': 'Новости науки'}])
+            self.assertEqual(result[0], 'Вот результат поиска.')
+            search.assert_called_once_with('последние новости науки')
+
+    def test_unfenced_nested_json_preserves_public_text(self):
+        raw = 'Привет! assistant_memory: {"remember":[{"summary":"факт {а}","full":"текст"}]} Готово.'
+        visible, directive = extract_memory_directive(raw)
+        self.assertEqual(visible, 'Привет!  Готово.')
+        self.assertEqual(directive.remember[0]['summary'], 'факт {а}')
+
+    def test_truncated_directive_hidden_and_not_executed(self):
+        visible, directive = extract_memory_directive('Ответ. assistant_memory\n{"web_search":{"query":"test"}')
+        self.assertEqual(visible, 'Ответ.')
+        self.assertIsNone(directive.web_search)
+
+    def test_plain_marker_mention_is_not_a_call(self):
+        text = 'Слово assistant_memory обозначает служебный блок.'
+        self.assertEqual(extract_memory_directive(text)[0], text)
+
     def test_creator(self):
         self.assertIn('@Ne_gr_idi_rabotai', CAPABILITIES_PROMPT)
 
