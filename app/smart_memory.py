@@ -9,7 +9,7 @@ from typing import Any
 MEMORY_BLOCK_RE = re.compile(r"```assistant_memory\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 JSON_BLOCK_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
 TOKEN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9_]{3,}")
-DIRECTIVE_KEYS = {"remember", "recall", "timers", "schedule", "persona", "mode", "telegram_action", "telegram"}
+DIRECTIVE_KEYS = {"remember", "recall", "timers", "schedule", "persona", "mode", "telegram_action", "telegram", "web_search"}
 
 MEMORY_DIRECTIVE_PROMPT = """
 Функции умной памяти доступны через приватный управляющий блок.
@@ -78,6 +78,7 @@ class MemoryDirective:
     timers: list[dict[str, Any]]
     persona: str | None
     telegram_action: dict[str, Any] | None
+    web_search: str | None = None
 
 
 def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
@@ -86,9 +87,10 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
     timers: list[dict[str, Any]] = []
     persona: str | None = None
     telegram_action: dict[str, Any] | None = None
+    web_search: str | None = None
 
     def consume_payload(payload: object) -> bool:
-        nonlocal remember, recall, persona, telegram_action
+        nonlocal remember, recall, persona, telegram_action, web_search
         if not isinstance(payload, dict) or not (DIRECTIVE_KEYS & set(payload)):
             return False
         raw_remember = payload.get("remember", [])
@@ -108,6 +110,9 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
         raw_telegram = payload.get("telegram_action", payload.get("telegram"))
         if isinstance(raw_telegram, dict):
             telegram_action = raw_telegram
+        raw_search = payload.get("web_search")
+        if isinstance(raw_search, dict) and isinstance(raw_search.get("query"), str):
+            web_search = raw_search["query"]
         return True
 
     def consume(match: re.Match[str]) -> str:
@@ -129,7 +134,7 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
         standalone_payload = None
     if consume_payload(standalone_payload):
         cleaned = ""
-    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona, telegram_action=telegram_action)
+    return cleaned, MemoryDirective(remember=remember, recall=recall, timers=timers, persona=persona, telegram_action=telegram_action, web_search=web_search)
 
 
 def _consume_json_match(match: re.Match[str], consume_payload: Any) -> bool:
