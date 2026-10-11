@@ -55,6 +55,7 @@ TG_AUTHORIZED_SAMPLE_EVERY = max(0, int(os.getenv("TG_AUTHORIZED_SAMPLE_EVERY", 
 TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_SECRETARY_MODE = os.getenv("TG_SECRETARY_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_BOT_TO_BOT = os.getenv("TG_BOT_TO_BOT", "true").lower() not in {"0", "false", "no", "off"}
+TG_OPEN_ACCESS = os.getenv("TG_OPEN_ACCESS", "true").lower() not in {"0", "false", "no", "off"}
 TIMED_MEMORY_POLL_SECONDS = max(0.0, float(os.getenv("TIMED_MEMORY_POLL_SECONDS", "5")))
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
@@ -546,16 +547,22 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         audit_event("message_handled", client_id=client_id, conversation_id=conversation_id, channel=channel, persona=memory_response.get("persona"), command="memory", memory_saved=memory_response.get("memory_saved"), memory_recalled=memory_response.get("memory_recalled"), timed_memory_saved=memory_response.get("timed_memory_saved"), response_preview=memory_response.get("text"))
         return memory_response
 
-    messages = build_messages_for_model(client_id, conversation_id, text, active_persona, channel=channel, channel_context=channel_context)
+    history_text = str(body.get("history_text") or text)
+    messages = build_messages_for_model(client_id, conversation_id, history_text, active_persona, channel=channel, channel_context=channel_context)
 
-    storage.add_message(conversation_id, "user", text)
+    storage.add_message(conversation_id, "user", history_text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
     answer, model_mode, saved, recalled, timed_saved, requested_persona, telegram_action = complete_with_smart_memory(client_id, conversation_id, messages)
     if requested_persona in {"ANA", "ALIEN"}:
         active_persona = Persona(requested_persona)
         storage.set_persona(client_id, conversation_id, active_persona)
-    storage.add_message(conversation_id, "assistant", answer)
+    history_answer = answer
+    if channel == "telegram_group" and telegram_action:
+        history_answer = str(telegram_action.get("group_text") or answer) if telegram_action.get("reply_to") in {"group", "both"} else "Ответ отправлен в личные сообщения."
+        if telegram_action.get("mute"):
+            history_answer = "Запрошена проверка возможности временного мута."
+    storage.add_message(conversation_id, "assistant", history_answer)
 
     payload = response_payload(
         conversation_id,
@@ -629,6 +636,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     command_args = str(telegram_command.get("args") or "") if is_own_command else ""
     command_text = normalize_telegram_command(text) if is_own_command or telegram_command is None else text.strip()
     linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id)
+    is_authorized = is_authorized or TG_OPEN_ACCESS
     audit_event(
         "telegram_received",
         chat_id=chat_id,
@@ -651,6 +659,10 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         is_own_command=is_own_command,
     )
     if not should_process:
+        if chat_type in {"group", "supergroup"}:
+            group_scope = f"tg-group-{chat_id}"
+            storage.ensure_conversation(group_scope, group_scope)
+            storage.add_message(group_scope, "user", f"[Telegram id={telegram_user_id} @{username}] {text}")
         audit_event(
             "telegram_ignored",
             reason=decision_reason,
@@ -685,7 +697,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "handled": "linked", "migrated_memories": migrated}
     if command_name == "unlink":
         storage.unlink_telegram_user(telegram_user_id)
-        reply = "Привязка Telegram отключена. Дальше будет гостевой режим."
+        reply = "Привязка Telegram отключена." + (" Свободный доступ остаётся включён." if TG_OPEN_ACCESS else " Дальше будет гостевой режим.")
         send_telegram_message(chat_id, reply)
         audit_event("telegram_command", command="unlinked", chat_id=chat_id, telegram_user_id=telegram_user_id, response_preview=reply)
         return {"ok": True, "handled": "unlinked"}
@@ -705,6 +717,10 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "handled": "guest_disabled"}
 
     conversation_id = DEFAULT_CONVERSATION_ID if is_authorized else f"telegram-{telegram_user_id}"
+    if TG_OPEN_ACCESS and not user.get("app_client_id"):
+        conversation_id = f"telegram-{telegram_user_id}"
+    if chat_type in {"group", "supergroup"}:
+        linked_client_id = conversation_id = f"tg-group-{chat_id}"
     user_text = command_text
     if not is_authorized:
         user_text = f"[Telegram guest @{user.get('username') or telegram_user_id}] {command_text}"
@@ -712,9 +728,18 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "client_id": linked_client_id,
         "conversation_id": conversation_id,
         "text": user_text,
+        "history_text": f"[Telegram id={telegram_user_id} @{username}] {user_text}" if chat_type != "private" else user_text,
         "channel": "telegram_group" if chat_type != "private" else "telegram",
         "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode),
     })
+    action = payload.get("telegram_action") or {}
+    if isinstance(action, dict) and action.get("mute"):
+        from app.telegram_moderation import execute_mute
+        outcome = execute_mute(chat_id, chat_type, action["mute"], TG_BOT_API_KEY)
+        send_telegram_message(chat_id, outcome["text"])
+        audit_event("telegram_moderation", chat_id=chat_id, **outcome)
+        storage.add_message(conversation_id, "assistant", outcome["text"])
+        return {"ok": True, "handled": "moderation", **outcome}
     route_result = route_telegram_response(chat_id, telegram_user_id, user, chat_type, payload, message_id=message_id)
     audit_event(
         "telegram_handled",
@@ -759,6 +784,9 @@ def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[
             is_bot=bool(user.get("is_bot")),
         )
     linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id) if telegram_user_id else (DEFAULT_CLIENT_ID, False)
+    is_authorized = is_authorized or (TG_OPEN_ACCESS and bool(telegram_user_id))
+    if chat.get("type") in {"group", "supergroup"}:
+        linked_client_id = f"tg-group-{chat_id}"
     remembered = False
     if telegram_user_id and is_authorized and emoji_list:
         summary = f"Telegram-реакция {' '.join(emoji_list)} на сообщение бота"
@@ -983,6 +1011,7 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
         "private_to_telegram_user_id": private_to_telegram_user_id[:64],
         "group_text_explicit": bool(group_text),
         "private_text_explicit": bool(private_text),
+        "mute": action.get("mute") if isinstance(action.get("mute"), dict) else None,
     }
 
 
@@ -1005,6 +1034,8 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
+        lines.append("История и память этой группы общие для участников. Личная память здесь недоступна. Автор каждого сообщения указан в истории.")
+        lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго 1–10 целых минут. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
         lines.append("В группе отвечай особенно компактно: обычно 1-3 короткие строки. Если нужен длинный или личный ответ, используй telegram_action для личного сообщения.")
         lines.append(
             "В этой группе можно приватно запросить assistant_memory telegram_action: "
@@ -1196,6 +1227,8 @@ def set_telegram_reaction(chat_id: object, message_id: object, emoji: str) -> No
         response.read()
 
 def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: bool) -> str:
+    if TG_OPEN_ACCESS and not user.get("app_client_id"):
+        return "Привет! Сейчас включён свободный доступ ко всем функциям. Для синхронизации с приложением можно отправить /link <client_id>."
     username = user.get("username") or user.get("first_name") or "гость"
     if is_authorized:
         return f"Привет, {username}. Telegram уже привязан к app client_id: {client_id}. Пиши сюда — я синхронизируюсь с основной памятью."

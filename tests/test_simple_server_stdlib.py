@@ -19,6 +19,13 @@ from simple_server import (
 
 
 class SimpleServerTests(unittest.TestCase):
+    def setUp(self):
+        self.old_open_access = simple_server.TG_OPEN_ACCESS
+        simple_server.TG_OPEN_ACCESS = False
+
+    def tearDown(self):
+        simple_server.TG_OPEN_ACCESS = self.old_open_access
+
     def test_valid_messages_accepts_chat_history(self) -> None:
         self.assertTrue(
             valid_messages(
@@ -426,8 +433,8 @@ class SimpleServerTests(unittest.TestCase):
             with isolated_storage():
                 simple_server.handle_telegram_update(telegram_update("/link primary-user"))
                 response = simple_server.handle_telegram_update(telegram_update("/alien@VBDsThirdSon_bot", chat_type="group"))
-                history = handle_history_request({"client_id": "primary-user", "conversation_id": "default", "limit": 5})
-                persona = simple_server.storage.ensure_conversation("primary-user", "default")["persona"]
+                history = handle_history_request({"client_id": "tg-group-555", "conversation_id": "tg-group-555", "limit": 5})
+                persona = simple_server.storage.ensure_conversation("tg-group-555", "tg-group-555")["persona"]
         finally:
             simple_server.TG_BOT_API_KEY = old_key
             simple_server.TG_BOT_USERNAME = old_username
@@ -582,7 +589,7 @@ class SimpleServerTests(unittest.TestCase):
                         "new_reaction": [{"type": "emoji", "emoji": "👍"}],
                     }
                 })
-                memory = simple_server.storage.list_memories("primary-user", limit=10)
+                memory = simple_server.storage.list_memories("tg-group-555", limit=10)
         finally:
             simple_server.TG_BOT_API_KEY = old_key
             simple_server.send_telegram_message = old_send
