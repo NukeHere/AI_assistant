@@ -7,6 +7,23 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class GroupTests(unittest.TestCase):
+    def test_group_note_is_available_in_private_context_only_for_sender(self):
+        prompts = []
+        def complete(messages):
+            prompts.append(messages)
+            return '{"telegram_action":{"reply_to":"ignore","group_note":"В группе договорились обсудить проект Альфа завтра."}}', "mock"
+        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "send_telegram_message"), patch.object(server, "complete", complete):
+            server.handle_telegram_update(telegram_update("бот, обсудим Альфу завтра", "supergroup"))
+            server.handle_telegram_update(telegram_update("О чём договорились в группе?"))
+            context = "\n".join(m["content"] for m in prompts[-1])
+            self.assertIn("не личная переписка", context)
+            self.assertIn("chat_id=555", context)
+            self.assertIn("Альфа", context)
+            other = telegram_update("Что было?")
+            other["message"]["from"]["id"] = 888
+            server.handle_telegram_update(other)
+            self.assertFalse(any("Альфа" in m["content"] for m in prompts[-1]))
+
     def test_subscription_preserves_existing_types_and_pending_updates(self):
         info = {"url": "https://ai-assistant-4yn0.onrender.com/v1/telegram/webhook", "allowed_updates": ["message", "callback_query"], "max_connections": 10}
         with patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_WEBHOOK_SECRET", "test-secret"), patch.dict("os.environ", {"TG_WEBHOOK_URL": info["url"]}), patch.object(moderation, "api_call", side_effect=[info, True]) as api:
@@ -68,11 +85,27 @@ class GroupTests(unittest.TestCase):
 
 
 class ModerationTests(unittest.TestCase):
+    def test_unmute_releases_restricted_member(self):
+        replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "restricted", "is_member": True, "user": {"id": 777, "username": "user_name"}}, True]
+        with patch.object(moderation, "api_call", side_effect=replies) as api:
+            result = moderation.execute_unmute(-123, "supergroup", {"user_id": "777", "reason": "ошибка модерации"}, "test")
+            self.assertTrue(result["success"])
+            self.assertIn("снят мут", result["text"])
+            self.assertTrue(all(api.call_args.args[2]["permissions"].values()))
+            self.assertEqual(api.call_args.args[2]["until_date"], 0)
+
+    def test_unmute_does_not_claim_success_when_telegram_fails(self):
+        replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "restricted", "is_member": True}, RuntimeError("denied")]
+        with patch.object(moderation, "api_call", side_effect=replies):
+            result = moderation.execute_unmute(-123, "supergroup", {"user_id": "777", "reason": "ошибка"}, "test")
+            self.assertFalse(result["success"])
+            self.assertIn("не снят", result["text"])
+
     def test_mute_resolves_username_and_checks_current_owner(self):
         replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "member", "user": {"id": 777, "username": "User_Name"}}, True]
         lookup = lambda name: {"telegram_user_id": "777"} if name == "user_name" else None
         with patch.object(moderation, "api_call", side_effect=replies) as api:
-            result = moderation.execute_mute(-123, "supergroup", {"username": "@USER_NAME", "minutes": 2, "reason": "флуд"}, "test", lookup)
+            result = moderation.execute_mute(-123, "supergroup", {"username": "@USER_NAME", "minutes": 1, "reason": "флуд"}, "test", lookup)
             self.assertTrue(result["success"])
             self.assertEqual(api.call_args.args[2]["user_id"], 777)
 
@@ -97,7 +130,7 @@ class ModerationTests(unittest.TestCase):
         self.addCleanup(key.stop)
 
     def test_valid_mute_and_server_enforced_duration(self):
-        for minutes in (1, 10):
+        for minutes in (1,):
             moderation._rights_cache.clear()
             replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "member", "user": {"username": "user_name"}}, True]
             with patch.object(moderation, "api_call", side_effect=replies) as api, patch.object(moderation.time, "time", return_value=1000):
@@ -109,7 +142,7 @@ class ModerationTests(unittest.TestCase):
 
     def test_invalid_durations_never_call_telegram(self):
         with patch.object(moderation, "api_call") as api:
-            for minutes in (0, -1, 11, True, 1.5, "10", None):
+            for minutes in (0, -1, 2, 10, 11, True, 1.5, "10", None):
                 self.assertFalse(moderation.execute_mute(-123, "supergroup", {"user_id": "777", "minutes": minutes, "reason": "флуд"}, "test")["success"])
             api.assert_not_called()
 

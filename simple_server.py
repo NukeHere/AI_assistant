@@ -560,7 +560,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     history_answer = answer
     if channel == "telegram_group" and telegram_action:
         history_answer = str(telegram_action.get("group_text") or answer) if telegram_action.get("reply_to") in {"group", "both"} else "Ответ отправлен в личные сообщения."
-        if telegram_action.get("mute"):
+        if telegram_action.get("mute") or telegram_action.get("unmute"):
             history_answer = "Запрошена проверка возможности временного мута."
         elif telegram_action.get("reply_to") == "ignore":
             history_answer = ""
@@ -738,13 +738,20 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode),
     })
     action = payload.get("telegram_action") or {}
-    if isinstance(action, dict) and action.get("mute"):
-        from app.telegram_moderation import execute_mute
-        outcome = execute_mute(chat_id, chat_type, action["mute"], TG_BOT_API_KEY, lookup_username=storage.get_telegram_user_by_username)
+    if isinstance(action, dict) and (action.get("mute") or action.get("unmute")):
+        from app.telegram_moderation import execute_mute, execute_unmute
+        operation = "unmute" if action.get("unmute") else "mute"
+        execute = execute_unmute if operation == "unmute" else execute_mute
+        outcome = execute(chat_id, chat_type, action[operation], TG_BOT_API_KEY, lookup_username=storage.get_telegram_user_by_username)
+        if outcome.get("success") and chat_type in {"group", "supergroup"}:
+            for participant_id in {telegram_user_id, str(outcome.get("target_user_id") or "")}:
+                remember_group_event(participant_id, chat, message_id, outcome["text"], operation)
         send_telegram_message(chat_id, outcome["text"])
-        audit_event("telegram_moderation", chat_id=chat_id, **outcome)
+        audit_event("telegram_moderation", chat_id=chat_id, operation=operation, **outcome)
         storage.add_message(conversation_id, "assistant", outcome["text"])
         return {"ok": True, "handled": "moderation", **outcome}
+    if chat_type in {"group", "supergroup"} and isinstance(action, dict) and action.get("group_note"):
+        remember_group_event(telegram_user_id, chat, message_id, str(action["group_note"]), "summary")
     route_result = route_telegram_response(chat_id, telegram_user_id, user, chat_type, payload, message_id=message_id)
     audit_event(
         "telegram_handled",
@@ -770,6 +777,23 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         response_preview=payload.get("text"),
     )
     return {"ok": True, "handled": "message", "authorized": is_authorized, "participation_mode": participation_mode, "decision_reason": decision_reason, **route_result}
+
+def remember_group_event(telegram_user_id, chat, message_id, summary, kind):
+    user = storage.get_telegram_user(telegram_user_id)
+    if not user:
+        return
+    client_id, linked = storage.telegram_client_context(telegram_user_id)
+    conversation_id = DEFAULT_CONVERSATION_ID if linked else f"telegram-{telegram_user_id}"
+    now, _ = current_times()
+    note = (f"[Событие из группы; не личная переписка. Группа: {chat.get('title') or chat.get('id')}; "
+            f"chat_id={chat.get('id')}; message_id={message_id}; время UTC={now}; "
+            f"участник Telegram id={telegram_user_id}] {str(summary).strip()[:600]}")
+    storage.ensure_conversation(client_id, conversation_id)
+    storage.add_message(conversation_id, "user", note,
+                        message_uid=f"group-event-{chat.get('id')}-{message_id}-{kind}-{telegram_user_id}")
+    storage.add_memory_cell(client_id=client_id, kind="thematic", summary=note[:500],
+                            full_content=note, topics=["telegram", "group_event", str(chat.get("id"))], importance=2)
+
 
 def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[str, object]:
     chat = reaction_update.get("chat") if isinstance(reaction_update.get("chat"), dict) else {}
@@ -1021,6 +1045,8 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
         "group_text_explicit": bool(group_text),
         "private_text_explicit": bool(private_text),
         "mute": action.get("mute") if isinstance(action.get("mute"), dict) else None,
+        "unmute": action.get("unmute") if isinstance(action.get("unmute"), dict) else None,
+        "group_note": str(action.get("group_note") or "").strip()[:600],
     }
 
 
@@ -1043,10 +1069,11 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
+        lines.append('Чтобы сохранить важный эпизод для будущего разговора с текущим отправителем в личке, добавь telegram_action.group_note: краткое фактическое резюме до 600 символов. Укажи участников по именам/ID из контекста. Используй выборочно для происшествий, договорённостей и значимых событий, а не каждого сообщения. Сервер сам пометит группу, время и источник. Не переноси личные секреты других людей. Для снятия мута используй telegram_action.unmute с username либо user_id и reason; без minutes. Мут сейчас только на одну минуту: minutes=1. Unmute не требует нового мута.')
         lines.append('Если участники разговаривают между собой и твой ответ не нужен, верни только assistant_memory JSON {"telegram_action":{"reply_to":"ignore"}}. Не вмешивайся только из-за активности беседы. При нарушении можно добавить mute в то же telegram_action: модерация выполняется независимо от ignore. События реакций в истории показывают автора, прежнюю и новую реакцию; пустая новая реакция означает удаление.')
         lines.append('Для мута по @нику укажи telegram_action.mute.username (например "user_name"), minutes и reason. Сервер найдёт числовой ID в сохранённой базе и проверит актуальный ник через Telegram. Не выдумывай ID. Если указан username, user_id можно не передавать. Отображаемое имя не является уникальным username.')
         lines.append("История и память этой группы общие для участников. Личная память здесь недоступна. Автор каждого сообщения указан в истории.")
-        lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго 1–10 целых минут. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
+        lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго одна минута. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
         lines.append("В группе отвечай особенно компактно: обычно 1-3 короткие строки. Если нужен длинный или личный ответ, используй telegram_action для личного сообщения.")
         lines.append(
             "В этой группе можно приватно запросить assistant_memory telegram_action: "

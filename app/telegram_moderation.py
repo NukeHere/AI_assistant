@@ -19,9 +19,9 @@ def api_call(token, method, payload):
     return result["result"]
 
 
-def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
+def execute_mute(chat_id, chat_type, action, token, lookup_username=None, *, unmute=False):
     def failed(reason):
-        return {"success": False, "text": f"Мут не выдан: {reason}."}
+        return {"success": False, "text": f"{'Мут не снят' if unmute else 'Мут не выдан'}: {reason}."}
 
     if chat_type != "supergroup":
         return failed("эта функция доступна только в супергруппах")
@@ -42,8 +42,8 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
     minutes = action.get("minutes")
     if not target.isdecimal() or int(target) <= 0:
         return failed("неизвестен числовой ID участника")
-    if type(minutes) is not int or not 1 <= minutes <= 10:
-        return failed("срок должен быть целым числом от 1 до 10 минут")
+    if not unmute and (type(minutes) is not int or minutes != 1):
+        return failed("максимальный срок мута сейчас 1 минута; укажи minutes=1")
     reason = str(action.get("reason") or "").strip()[:300]
     if not reason:
         return failed("не указана причина")
@@ -63,12 +63,22 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
         member = api_call(token, "getChatMember", {"chat_id": chat_id, "user_id": int(target)})
         if username and str((member.get("user") or {}).get("username") or "").lower() != username:
             return failed("ник участника изменился; дождитесь его нового сообщения")
-        if member.get("status") != "member":
+        if unmute and (member.get("status") != "restricted" or not member.get("is_member")):
+            return failed("участник не имеет снимаемого ограничения в этой группе")
+        if not unmute and member.get("status") != "member":
             return failed("участник администратор, отсутствует или уже ограничен")
-        until_date = int(time.time()) + minutes * 60
+        until_date = 0 if unmute else int(time.time()) + minutes * 60
+        permissions = {"can_send_messages": False, "can_react_to_messages": True}
+        if unmute:
+            permissions = {key: True for key in (
+                "can_send_messages", "can_send_audios", "can_send_documents", "can_send_photos",
+                "can_send_videos", "can_send_video_notes", "can_send_voice_notes", "can_send_polls",
+                "can_send_other_messages", "can_add_web_page_previews", "can_react_to_messages",
+                "can_edit_tag", "can_change_info", "can_invite_users", "can_pin_messages", "can_manage_topics",
+            )}
         if api_call(token, "restrictChatMember", {
             "chat_id": chat_id, "user_id": int(target),
-            "permissions": {"can_send_messages": False, "can_react_to_messages": True},
+            "permissions": permissions,
             "use_independent_chat_permissions": True,
             "until_date": until_date,
         }) is not True:
@@ -81,5 +91,9 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
     return {
         "success": True, "target_user_id": target, "minutes": minutes,
         "until_date": until_date, "reason": reason,
-        "text": f"Пользователь {name} замучен на {minutes} мин. Причина: {reason}",
+        "text": f"С пользователя {name} снят мут. Причина: {reason}" if unmute else f"Пользователь {name} замучен на {minutes} мин. Причина: {reason}",
     }
+
+
+def execute_unmute(chat_id, chat_type, action, token, lookup_username=None):
+    return execute_mute(chat_id, chat_type, action, token, lookup_username, unmute=True)
