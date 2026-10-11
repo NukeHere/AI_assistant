@@ -45,6 +45,28 @@ class GroupTests(unittest.TestCase):
 
 
 class ModerationTests(unittest.TestCase):
+    def test_mute_resolves_username_and_checks_current_owner(self):
+        replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "member", "user": {"id": 777, "username": "User_Name"}}, True]
+        lookup = lambda name: {"telegram_user_id": "777"} if name == "user_name" else None
+        with patch.object(moderation, "api_call", side_effect=replies) as api:
+            result = moderation.execute_mute(-123, "supergroup", {"username": "@USER_NAME", "minutes": 2, "reason": "флуд"}, "test", lookup)
+            self.assertTrue(result["success"])
+            self.assertEqual(api.call_args.args[2]["user_id"], 777)
+
+    def test_unknown_or_conflicting_username_never_mutes(self):
+        with patch.object(moderation, "api_call") as api:
+            for known, target in ((None, ""), ({"telegram_user_id": "777"}, "888")):
+                result = moderation.execute_mute(-123, "supergroup", {"username": "person", "user_id": target, "minutes": 1, "reason": "флуд"}, "test", lambda _: known)
+                self.assertFalse(result["success"])
+            api.assert_not_called()
+
+    def test_stale_username_never_mutes_old_owner(self):
+        replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "member", "user": {"id": 777, "username": "new_name"}}]
+        with patch.object(moderation, "api_call", side_effect=replies) as api:
+            result = moderation.execute_mute(-123, "supergroup", {"username": "old_name", "minutes": 1, "reason": "флуд"}, "test", lambda _: {"telegram_user_id": "777"})
+            self.assertFalse(result["success"])
+            self.assertFalse(any(c.args[1] == "restrictChatMember" for c in api.call_args_list))
+
     def setUp(self):
         moderation._rights_cache.clear()
         key = patch.object(server, "TG_BOT_API_KEY", "test")

@@ -19,7 +19,7 @@ def api_call(token, method, payload):
     return result["result"]
 
 
-def execute_mute(chat_id, chat_type, action, token):
+def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
     def failed(reason):
         return {"success": False, "text": f"Мут не выдан: {reason}."}
 
@@ -28,6 +28,17 @@ def execute_mute(chat_id, chat_type, action, token):
     if not isinstance(action, dict):
         return failed("некорректные параметры")
     target = str(action.get("user_id") or "")
+    username = str(action.get("username") or "").strip().lstrip("@").lower()
+    if target.startswith("@") and not username:
+        username, target = target[1:].lower(), ""
+    if username:
+        known = lookup_username(username) if lookup_username else None
+        if not known:
+            return failed(f"не знаю ID @{username}; пусть участник сначала напишет боту")
+        resolved = str(known.get("telegram_user_id") or "")
+        if target and target != resolved:
+            return failed("указанные ID и ник относятся к разным пользователям")
+        target = resolved
     minutes = action.get("minutes")
     if not target.isdecimal() or int(target) <= 0:
         return failed("неизвестен числовой ID участника")
@@ -50,6 +61,8 @@ def execute_mute(chat_id, chat_type, action, token):
         if int(target) == cached[1]:
             return failed("нельзя ограничить самого бота")
         member = api_call(token, "getChatMember", {"chat_id": chat_id, "user_id": int(target)})
+        if username and str((member.get("user") or {}).get("username") or "").lower() != username:
+            return failed("ник участника изменился; дождитесь его нового сообщения")
         if member.get("status") != "member":
             return failed("участник администратор, отсутствует или уже ограничен")
         until_date = int(time.time()) + minutes * 60

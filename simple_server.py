@@ -735,7 +735,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     action = payload.get("telegram_action") or {}
     if isinstance(action, dict) and action.get("mute"):
         from app.telegram_moderation import execute_mute
-        outcome = execute_mute(chat_id, chat_type, action["mute"], TG_BOT_API_KEY)
+        outcome = execute_mute(chat_id, chat_type, action["mute"], TG_BOT_API_KEY, lookup_username=storage.get_telegram_user_by_username)
         send_telegram_message(chat_id, outcome["text"])
         audit_event("telegram_moderation", chat_id=chat_id, **outcome)
         storage.add_message(conversation_id, "assistant", outcome["text"])
@@ -1034,6 +1034,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
+        lines.append('Для мута по @нику укажи telegram_action.mute.username (например "user_name"), minutes и reason. Сервер найдёт числовой ID в сохранённой базе и проверит актуальный ник через Telegram. Не выдумывай ID. Если указан username, user_id можно не передавать. Отображаемое имя не является уникальным username.')
         lines.append("История и память этой группы общие для участников. Личная память здесь недоступна. Автор каждого сообщения указан в истории.")
         lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго 1–10 целых минут. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
         lines.append("В группе отвечай особенно компактно: обычно 1-3 короткие строки. Если нужен длинный или личный ответ, используй telegram_action для личного сообщения.")
