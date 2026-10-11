@@ -7,6 +7,29 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class GroupTests(unittest.TestCase):
+    def test_subscription_preserves_existing_types_and_pending_updates(self):
+        info = {"url": "https://ai-assistant-4yn0.onrender.com/v1/telegram/webhook", "allowed_updates": ["message", "callback_query"], "max_connections": 10}
+        with patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_WEBHOOK_SECRET", "test-secret"), patch.dict("os.environ", {"TG_WEBHOOK_URL": info["url"]}), patch.object(moderation, "api_call", side_effect=[info, True]) as api:
+            server.ensure_telegram_reaction_subscription()
+            payload = api.call_args.args[2]
+            self.assertEqual(payload["allowed_updates"], ["message", "callback_query", "message_reaction"])
+            self.assertFalse(payload["drop_pending_updates"])
+            self.assertEqual(payload["max_connections"], 10)
+
+    def test_ignore_sends_nothing_even_with_text_and_reaction(self):
+        with patch.object(server, "send_telegram_message") as send, patch.object(server, "try_set_telegram_reaction") as react:
+            result = server.route_telegram_response(-1, "777", {}, "supergroup", {"text": "Не нужно отправлять", "telegram_action": {"reply_to": "ignore", "reaction_emoji": "👍"}}, message_id=4)
+            self.assertEqual(result["telegram_route"], "ignore")
+            send.assert_not_called()
+            react.assert_not_called()
+
+    def test_removed_reaction_is_visible_in_group_history(self):
+        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True):
+            server.handle_telegram_reaction_update({"chat": {"id": -123, "type": "supergroup"}, "message_id": 7, "user": {"id": 777, "username": "user_name"}, "old_reaction": [{"type": "emoji", "emoji": "👍"}], "new_reaction": []})
+            history = server.storage.recent_messages("tg-group--123", 5)
+            self.assertIn("👍 → нет", history[-1]["content"])
+            self.assertIn("id=777", history[-1]["content"])
+
     def setUp(self):
         key = patch.object(server, "TG_BOT_API_KEY", "test")
         key.start()
@@ -82,6 +105,7 @@ class ModerationTests(unittest.TestCase):
                 self.assertTrue(result["success"])
                 self.assertIn("@user_name", result["text"])
                 self.assertEqual(api.call_args.args[2]["until_date"], 1000 + minutes * 60)
+                self.assertTrue(api.call_args.args[2]["permissions"]["can_react_to_messages"])
 
     def test_invalid_durations_never_call_telegram(self):
         with patch.object(moderation, "api_call") as api:
@@ -102,7 +126,7 @@ class ModerationTests(unittest.TestCase):
                 self.assertFalse(any(c.args[1] == "restrictChatMember" for c in api.call_args_list))
 
     def test_handler_announces_only_real_moderation_result(self):
-        raw = '{"telegram_action":{"mute":{"user_id":"777","minutes":2,"reason":"флуд"}}}'
+        raw = '{"telegram_action":{"reply_to":"ignore","mute":{"user_id":"777","minutes":2,"reason":"флуд"}}}'
         with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", return_value=(raw, "mock")), patch.object(server, "send_telegram_message") as send, patch.object(moderation, "execute_mute", return_value={"success": False, "text": "Мут не выдан: нет прав."}):
             result = server.handle_telegram_update(telegram_update("бот, проверь флуд", "supergroup"))
             self.assertFalse(result["success"])

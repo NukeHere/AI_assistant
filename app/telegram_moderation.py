@@ -68,7 +68,7 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None):
         until_date = int(time.time()) + minutes * 60
         if api_call(token, "restrictChatMember", {
             "chat_id": chat_id, "user_id": int(target),
-            "permissions": {"can_send_messages": False},
+            "permissions": {"can_send_messages": False, "can_react_to_messages": True},
             "use_independent_chat_permissions": True,
             "until_date": until_date,
         }) is not True:

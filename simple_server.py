@@ -562,7 +562,10 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         history_answer = str(telegram_action.get("group_text") or answer) if telegram_action.get("reply_to") in {"group", "both"} else "Ответ отправлен в личные сообщения."
         if telegram_action.get("mute"):
             history_answer = "Запрошена проверка возможности временного мута."
-    storage.add_message(conversation_id, "assistant", history_answer)
+        elif telegram_action.get("reply_to") == "ignore":
+            history_answer = ""
+    if history_answer:
+        storage.add_message(conversation_id, "assistant", history_answer)
 
     payload = response_payload(
         conversation_id,
@@ -658,6 +661,8 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         reply_to_bot=reply_to_bot,
         is_own_command=is_own_command,
     )
+    if not should_process and chat_type == "supergroup":
+        should_process, decision_reason, participation_mode = True, "moderation_review", "moderation"
     if not should_process:
         if chat_type in {"group", "supergroup"}:
             group_scope = f"tg-group-{chat_id}"
@@ -788,9 +793,13 @@ def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[
     if chat.get("type") in {"group", "supergroup"}:
         linked_client_id = f"tg-group-{chat_id}"
     remembered = False
-    if telegram_user_id and is_authorized and emoji_list:
-        summary = f"Telegram-реакция {' '.join(emoji_list)} на сообщение бота"
-        full = f"Пользователь Telegram @{username or telegram_user_id} поставил реакцию {' '.join(emoji_list)} на сообщение {message_id} в чате {chat_id}."
+    if telegram_user_id and is_authorized:
+        previous = telegram_reaction_emojis(reaction_update.get("old_reaction"))
+        summary = f"Telegram-реакция {' '.join(emoji_list) or 'удалена'} на сообщение {message_id}"
+        full = f"Пользователь Telegram @{username or telegram_user_id} (id={telegram_user_id}) изменил реакции на сообщение {message_id} в чате {chat_id}: {' '.join(previous) or 'нет'} → {' '.join(emoji_list) or 'нет'}."
+        conversation_id = linked_client_id if chat.get("type") in {"group", "supergroup"} else (DEFAULT_CONVERSATION_ID if storage.telegram_client_context(telegram_user_id)[1] else f"telegram-{telegram_user_id}")
+        storage.ensure_conversation(linked_client_id, conversation_id)
+        storage.add_message(conversation_id, "user", full)
         storage.add_memory_cell(
             client_id=linked_client_id,
             kind="thematic",
@@ -994,7 +1003,7 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
     if not isinstance(action, dict):
         return None
     reply_to = str(action.get("reply_to") or action.get("target") or "group").strip().lower()
-    if reply_to not in {"group", "private", "both"}:
+    if reply_to not in {"group", "private", "both", "ignore"}:
         reply_to = "group"
     group_text = str(action.get("group_text") or "").strip()
     private_text = str(action.get("private_text") or "").strip()
@@ -1034,6 +1043,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
+        lines.append('Если участники разговаривают между собой и твой ответ не нужен, верни только assistant_memory JSON {"telegram_action":{"reply_to":"ignore"}}. Не вмешивайся только из-за активности беседы. При нарушении можно добавить mute в то же telegram_action: модерация выполняется независимо от ignore. События реакций в истории показывают автора, прежнюю и новую реакцию; пустая новая реакция означает удаление.')
         lines.append('Для мута по @нику укажи telegram_action.mute.username (например "user_name"), minutes и reason. Сервер найдёт числовой ID в сохранённой базе и проверит актуальный ник через Telegram. Не выдумывай ID. Если указан username, user_id можно не передавать. Отображаемое имя не является уникальным username.')
         lines.append("История и память этой группы общие для участников. Личная память здесь недоступна. Автор каждого сообщения указан в истории.")
         lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго 1–10 целых минут. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
@@ -1077,6 +1087,8 @@ def telegram_action_audit_details(action: dict[str, object] | None) -> dict[str,
 def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[str, object], chat_type: str, payload: dict[str, object], message_id: object | None = None) -> dict[str, object]:
     answer = str(payload.get("text") or "")
     action = sanitize_telegram_action(payload.get("telegram_action")) or {"reply_to": "group", "mention_sender": False, "group_text": "", "private_text": "", "reaction_emoji": ""}
+    if action.get("reply_to") == "ignore" and chat_type in {"group", "supergroup"}:
+        return {"telegram_route": "ignore", "telegram_group_sent": False, "telegram_private_sent": False, "telegram_reaction_sent": False, "telegram_text_suppressed": True}
     reaction_sent = False
     reaction_emoji = str(action.get("reaction_emoji") or "").strip()
     if reaction_emoji and message_id is not None:
@@ -1513,10 +1525,37 @@ class AssistantHandler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {format % args}")
 
 
+def ensure_telegram_reaction_subscription() -> None:
+    if not TG_BOT_API_KEY or not TG_WEBHOOK_SECRET:
+        audit_event("telegram_reaction_subscription_skipped", reason="missing_bot_or_webhook_configuration")
+        return
+    from app.telegram_moderation import api_call
+    try:
+        info = api_call(TG_BOT_API_KEY, "getWebhookInfo", {})
+        expected = os.getenv("TG_WEBHOOK_URL", "https://ai-assistant-4yn0.onrender.com/v1/telegram/webhook")
+        if info.get("url") != expected:
+            audit_event("telegram_reaction_subscription_skipped", reason="different_or_missing_webhook")
+            return
+        allowed = info.get("allowed_updates") or ["message", "edited_message", "channel_post", "edited_channel_post", "inline_query", "chosen_inline_result", "callback_query", "shipping_query", "pre_checkout_query", "poll", "poll_answer", "my_chat_member", "chat_join_request"]
+        if "message_reaction" not in allowed:
+            updated = api_call(TG_BOT_API_KEY, "setWebhook", {
+                "url": expected, "secret_token": TG_WEBHOOK_SECRET,
+                "allowed_updates": list(dict.fromkeys([*allowed, "message_reaction"])),
+                "drop_pending_updates": False,
+                "max_connections": info.get("max_connections", 40),
+            })
+            if updated is not True:
+                raise RuntimeError("Webhook update failed")
+        audit_event("telegram_reaction_subscription_ready")
+    except Exception as error:
+        audit_event("telegram_reaction_subscription_failed", error_type=type(error).__name__)
+
+
 def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     scheduler_stop, _ = start_timed_memory_scheduler()
+    Thread(target=ensure_telegram_reaction_subscription, name="telegram-reactions-setup", daemon=True).start()
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
     print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/client/register, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)

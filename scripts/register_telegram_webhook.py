@@ -26,6 +26,7 @@ def main() -> None:
     webhook_url = os.getenv("TG_WEBHOOK_URL", "https://ai-assistant-4yn0.onrender.com/v1/telegram/webhook").strip()
     secret = os.getenv("TG_WEBHOOK_SECRET", "").strip()
     payload: dict[str, object] = {"url": webhook_url, "drop_pending_updates": False}
+    payload["allowed_updates"] = ["message", "message_reaction", "my_chat_member"]
     if secret:
         payload["secret_token"] = secret
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
