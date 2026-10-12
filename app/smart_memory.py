@@ -145,6 +145,23 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
         cleaned = cleaned[:match.start()] + cleaned[end:]
         offset = match.start()
     cleaned = cleaned.strip()
+    # A model may append an unfenced Telegram directive after explanatory text.
+    # Decode the whole object so nested keys and braces inside strings are safe.
+    telegram_marker = re.compile(r'\{\s*"(?:telegram_action|telegram)"\s*:')
+    offset = 0
+    while match := telegram_marker.search(cleaned, offset):
+        try:
+            payload, length = decoder.raw_decode(cleaned[match.start():])
+        except json.JSONDecodeError:
+            offset = match.end()
+            continue
+        end = match.start() + length
+        if consume_payload(payload):
+            cleaned = cleaned[:match.start()] + cleaned[end:]
+            offset = match.start()
+        else:
+            offset = end
+    cleaned = cleaned.strip()
     try:
         standalone_payload = json.loads(cleaned)
     except (json.JSONDecodeError, TypeError):

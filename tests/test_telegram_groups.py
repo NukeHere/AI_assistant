@@ -7,6 +7,17 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class GroupTests(unittest.TestCase):
+    def test_bare_mention_keeps_nonempty_input_and_direct_address_context(self):
+        prompts = []
+        def complete(messages):
+            prompts.append(messages)
+            return "Я здесь.", "mock"
+        with isolated_storage(), patch.object(server, "TG_BOT_USERNAME", "VBDsThirdSon_bot"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", complete), patch.object(server, "send_telegram_message") as send:
+            result = server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot", "supergroup"))
+            self.assertTrue(result["telegram_group_sent"])
+            self.assertIn("адресовано тебе напрямую", "\n".join(m["content"] for m in prompts[0]))
+            send.assert_called_once()
+
     def test_group_note_is_available_in_private_context_only_for_sender(self):
         prompts = []
         def complete(messages):
@@ -36,6 +47,14 @@ class GroupTests(unittest.TestCase):
     def test_ignore_sends_nothing_even_with_text_and_reaction(self):
         with patch.object(server, "send_telegram_message") as send, patch.object(server, "try_set_telegram_reaction") as react:
             result = server.route_telegram_response(-1, "777", {}, "supergroup", {"text": "Не нужно отправлять", "telegram_action": {"reply_to": "ignore", "reaction_emoji": "👍"}}, message_id=4)
+            self.assertEqual(result["telegram_route"], "ignore")
+            send.assert_not_called()
+            react.assert_not_called()
+
+    def test_ignore_after_explanation_is_not_sent_to_group(self):
+        raw = 'We should ignore as no direct question or request.{\n"telegram_action": {\n"reply_to": "ignore"\n}\n}'
+        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", return_value=(raw, "mock")), patch.object(server, "send_telegram_message") as send, patch.object(server, "try_set_telegram_reaction") as react:
+            result = server.handle_telegram_update(telegram_update("бот, просто проверка", "supergroup"))
             self.assertEqual(result["telegram_route"], "ignore")
             send.assert_not_called()
             react.assert_not_called()
