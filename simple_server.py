@@ -63,6 +63,13 @@ TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0"
 TG_SECRETARY_MODE = os.getenv("TG_SECRETARY_MODE", "true").lower() not in {"0", "false", "no", "off"}
 TG_BOT_TO_BOT = os.getenv("TG_BOT_TO_BOT", "true").lower() not in {"0", "false", "no", "off"}
 TG_OPEN_ACCESS = os.getenv("TG_OPEN_ACCESS", "true").lower() not in {"0", "false", "no", "off"}
+
+
+def telegram_video_enabled() -> bool:
+    """Keep automatic video downloading off until a working source route exists."""
+    return os.getenv("TG_VIDEO_DOWNLOAD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
 TIMED_MEMORY_POLL_SECONDS = max(0.0, float(os.getenv("TIMED_MEMORY_POLL_SECONDS", "5")))
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
@@ -693,6 +700,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     )
 
     media_url = find_video_url(text) if body.get("message") is message and not is_bot else None
+    if media_url and not telegram_video_enabled():
+        audit_event("telegram_media_disabled", chat_id=chat_id, message_id=message_id)
+        return {"ok": True, "ignored": True, "reason": "media_disabled"}
     if media_url and (is_authorized or TG_GUEST_CHAT_MODE):
         conversation_id = f"tg-group-{chat_id}" if chat_type in {"group", "supergroup"} else (
             linked_client_id if is_authorized and user.get("app_client_id") else f"telegram-{telegram_user_id}"
@@ -1389,6 +1399,8 @@ def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: 
 def queue_telegram_media(chat_id: object, message_id: object | None, url: str, conversation_id: str) -> bool:
     """Bound the number of pending downloads and deduplicate webhook retries."""
     global TELEGRAM_MEDIA_WORKER_STARTED
+    if not telegram_video_enabled():
+        return False
     key = (str(chat_id), str(message_id))
     with TELEGRAM_MEDIA_LOCK:
         if key in TELEGRAM_MEDIA_SEEN_SET:
@@ -1785,7 +1797,8 @@ def ensure_telegram_reaction_subscription() -> None:
 def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
-    prepare_pot_provider_async()
+    if telegram_video_enabled():
+        prepare_pot_provider_async()
     scheduler_stop, _ = start_timed_memory_scheduler()
     Thread(target=ensure_telegram_reaction_subscription, name="telegram-reactions-setup", daemon=True).start()
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)

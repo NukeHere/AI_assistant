@@ -231,7 +231,7 @@ class TelegramMediaTests(unittest.TestCase):
         self.assertLessEqual(max(connection.chunks), 64 * 1024)
 
     def test_webhook_queues_link_without_calling_model(self):
-        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "queue_telegram_media", return_value=True) as queued, patch.object(server, "complete") as complete:
+        with isolated_storage(), patch.dict("os.environ", {"TG_VIDEO_DOWNLOAD_ENABLED": "true"}), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "queue_telegram_media", return_value=True) as queued, patch.object(server, "complete") as complete:
             result = server.handle_telegram_update(telegram_update("Смотри https://youtu.be/abc123"))
             self.assertEqual(result["handled"], "media_queued")
             self.assertEqual(queued.call_args.args[2], "https://youtu.be/abc123")
@@ -241,10 +241,17 @@ class TelegramMediaTests(unittest.TestCase):
         update = telegram_update("ignored")
         update["message"].pop("text")
         update["message"]["caption"] = "https://www.instagram.com/reel/abc123/"
-        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "queue_telegram_media", return_value=True) as queued:
+        with isolated_storage(), patch.dict("os.environ", {"TG_VIDEO_DOWNLOAD_ENABLED": "true"}), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "queue_telegram_media", return_value=True) as queued:
             result = server.handle_telegram_update(update)
         self.assertEqual(result["handled"], "media_queued")
         self.assertEqual(queued.call_args.args[2], "https://www.instagram.com/reel/abc123/")
+
+    def test_webhook_ignores_video_links_while_downloads_are_disabled(self):
+        with isolated_storage(), patch.dict("os.environ", {"TG_VIDEO_DOWNLOAD_ENABLED": "false"}), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "queue_telegram_media") as queued, patch.object(server, "complete") as complete:
+            result = server.handle_telegram_update(telegram_update("https://www.tiktok.com/@creator/video/123456"))
+        self.assertEqual(result["reason"], "media_disabled")
+        queued.assert_not_called()
+        complete.assert_not_called()
 
     def test_unaddressed_message_from_another_bot_is_ignored(self):
         update = telegram_update("Видео скачано")
