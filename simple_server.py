@@ -754,6 +754,30 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         conversation_id = f"telegram-{telegram_user_id}"
     if chat_type in {"group", "supergroup"}:
         linked_client_id = conversation_id = f"tg-group-{chat_id}"
+    if re.search(r"(?iu)(?<!\w)(?:отправь|пришли|скинь|пошли|покажи)(?!\w).{0,60}(?<!\w)стикер(?:а|ок|очек)?(?!\w)", command_text):
+        available_emojis = storage.telegram_sticker_emojis(chat_id)
+        storage.ensure_conversation(linked_client_id, conversation_id)
+        storage.add_message(conversation_id, "user", f"[Telegram id={telegram_user_id} @{username}] {command_text}" if chat_type != "private" else command_text)
+        if available_emojis:
+            matching_emoji = next((emoji for emoji in available_emojis if emoji in command_text), None)
+            chosen_emoji = matching_emoji or random.choice(available_emojis)
+            sticker_id = random.choice(storage.telegram_sticker_ids(chat_id, chosen_emoji))
+            try:
+                from app.telegram_moderation import api_call
+                sticker_payload: dict[str, object] = {"chat_id": chat_id, "sticker": sticker_id}
+                if message_id is not None:
+                    sticker_payload["reply_parameters"] = {"message_id": message_id, "allow_sending_without_reply": True}
+                api_call(TG_BOT_API_KEY, "sendSticker", sticker_payload)
+                storage.add_message(conversation_id, "assistant", f"[Отправлен стикер {chosen_emoji}]")
+                return {"ok": True, "handled": "sticker", "telegram_route": "sticker"}
+            except Exception as error:
+                audit_event("telegram_sticker_send_failed", chat_id=chat_id, error_type=type(error).__name__)
+                reply = "Не удалось отправить стикер. Попробуй ещё раз."
+        else:
+            reply = "Пришли стикер из набора в этот чат, и я смогу его использовать."
+        send_telegram_message(chat_id, reply)
+        storage.add_message(conversation_id, "assistant", reply)
+        return {"ok": True, "handled": "sticker_unavailable", "telegram_route": "text"}
     user_text = command_text
     if not is_authorized:
         user_text = f"[Telegram guest @{user.get('username') or telegram_user_id}] {command_text}"
