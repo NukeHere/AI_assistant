@@ -108,6 +108,18 @@ class Storage:
 
                 create index if not exists idx_telegram_users_app_client
                     on telegram_users (app_client_id);
+
+                create table if not exists telegram_stickers (
+                    chat_id text not null,
+                    file_unique_id text not null,
+                    file_id text not null,
+                    emoji text not null,
+                    set_name text not null default '',
+                    primary key (chat_id, file_unique_id)
+                );
+
+                create index if not exists idx_telegram_stickers_chat_emoji
+                    on telegram_stickers (chat_id, emoji);
                 """
             )
             self._ensure_column(conn, "memory_cells", "embedding_json", "text not null default '[]'")
@@ -119,6 +131,55 @@ class Storage:
             conn.execute("create index if not exists idx_messages_conversation_created on messages (conversation_id, created_at, id)")
             self._ensure_column(conn, "timed_memories", "timer_uid", "text")
             self._ensure_column(conn, "timed_memories", "materialized_message_uid", "text")
+
+    def save_telegram_stickers(self, chat_id: object, stickers: list[dict[str, object]]) -> int:
+        rows = []
+        for sticker in stickers:
+            if not isinstance(sticker, dict):
+                continue
+            file_id = str(sticker.get("file_id") or "").strip()
+            unique_id = str(sticker.get("file_unique_id") or "").strip()
+            emoji = str(sticker.get("emoji") or "").strip()
+            if file_id and unique_id and emoji:
+                rows.append((str(chat_id), unique_id, file_id, emoji[:32], str(sticker.get("set_name") or "")[:128]))
+        if not rows:
+            return 0
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """insert into telegram_stickers (chat_id, file_unique_id, file_id, emoji, set_name)
+                   values (?, ?, ?, ?, ?)
+                   on conflict(chat_id, file_unique_id) do update set
+                   file_id=excluded.file_id, emoji=excluded.emoji, set_name=excluded.set_name""",
+                rows,
+            )
+        return len(rows)
+
+    def telegram_sticker_set_known(self, chat_id: object, set_name: str) -> bool:
+        with self._lock, self._connect() as conn:
+            return conn.execute(
+                "select 1 from telegram_stickers where chat_id = ? and set_name = ? limit 1",
+                (str(chat_id), set_name),
+            ).fetchone() is not None
+
+    def telegram_sticker_emojis(self, chat_id: object) -> list[str]:
+        with self._lock, self._connect() as conn:
+            return [
+                str(row["emoji"])
+                for row in conn.execute(
+                    "select distinct emoji from telegram_stickers where chat_id = ? order by emoji limit 32",
+                    (str(chat_id),),
+                )
+            ]
+
+    def telegram_sticker_ids(self, chat_id: object, emoji: str) -> list[str]:
+        with self._lock, self._connect() as conn:
+            return [
+                str(row["file_id"])
+                for row in conn.execute(
+                    "select file_id from telegram_stickers where chat_id = ? and emoji = ?",
+                    (str(chat_id), emoji),
+                )
+            ]
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
