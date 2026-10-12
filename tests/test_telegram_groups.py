@@ -7,6 +7,17 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class GroupTests(unittest.TestCase):
+    def test_bare_mention_keeps_nonempty_input_and_direct_address_context(self):
+        prompts = []
+        def complete(messages):
+            prompts.append(messages)
+            return "Я здесь.", "mock"
+        with isolated_storage(), patch.object(server, "TG_BOT_USERNAME", "VBDsThirdSon_bot"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", complete), patch.object(server, "send_telegram_message") as send:
+            result = server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot", "supergroup"))
+            self.assertTrue(result["telegram_group_sent"])
+            self.assertIn("адресовано тебе напрямую", "\n".join(m["content"] for m in prompts[0]))
+            send.assert_called_once()
+
     def test_group_note_is_available_in_private_context_only_for_sender(self):
         prompts = []
         def complete(messages):
