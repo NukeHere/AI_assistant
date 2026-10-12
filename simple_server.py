@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import random
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,7 @@ TG_BOT_API_KEY = os.getenv("TG_BOT_API_KEY", "")
 TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET", "")
 TG_BOT_USERNAME = os.getenv("TG_BOT_USERNAME", "VBDsThirdSon_bot").lstrip("@")
 TG_BOT_ID = os.getenv("TG_BOT_ID", "").strip()
+TG_STICKER_REPLY_CHANCE = min(1.0, max(0.0, float(os.getenv("TG_STICKER_REPLY_CHANCE", "0.08"))))
 TG_GROUP_ACTIVE_SECONDS = int(os.getenv("TG_GROUP_ACTIVE_SECONDS", "1800"))
 TG_AUTHORIZED_SAMPLE_EVERY = max(0, int(os.getenv("TG_AUTHORIZED_SAMPLE_EVERY", "5")))
 TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
@@ -626,7 +628,10 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if not isinstance(message, dict):
         audit_event("telegram_ignored", reason="no_message")
         return {"ok": True, "ignored": True, "reason": "no_message"}
+    sticker = message.get("sticker") if isinstance(message.get("sticker"), dict) else None
     text = str(message.get("text") or "").strip()
+    if not text and sticker:
+        text = f"[Стикер: {str(sticker.get('emoji') or 'без эмодзи')[:32]}]"
     if not text:
         audit_event("telegram_ignored", reason="no_text")
         return {"ok": True, "ignored": True, "reason": "no_text"}
@@ -643,6 +648,8 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if is_bot and not TG_BOT_TO_BOT:
         audit_event("telegram_ignored", reason="bot_sender", chat_id=chat_id, telegram_user_id=telegram_user_id, username=username, text_preview=text)
         return {"ok": True, "ignored": True, "reason": "bot_sender"}
+    if sticker:
+        remember_telegram_sticker(chat_id, sticker)
 
     addressed = is_telegram_addressed(text)
     reply_to_bot = is_reply_to_telegram_bot(message)
@@ -682,7 +689,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         reply_to_bot=reply_to_bot,
         is_own_command=is_own_command,
     )
-    if not should_process and chat_type == "supergroup":
+    if not should_process and chat_type == "supergroup" and not sticker:
         should_process, decision_reason, participation_mode = True, "moderation_review", "moderation"
     if not should_process:
         if chat_type in {"group", "supergroup"}:
@@ -1064,6 +1071,7 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
         "group_text": group_text[:2000],
         "private_text": private_text[:3800],
         "reaction_emoji": reaction_emoji[:16],
+        "sticker_emoji": str(action.get("sticker_emoji") or "").strip()[:32],
         "private_to_username": private_to_username[:64],
         "private_to_telegram_user_id": private_to_telegram_user_id[:64],
         "group_text_explicit": bool(group_text),
@@ -1090,6 +1098,10 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     ]
     if chat_title:
         lines.append(f"Название чата: {chat_title}.")
+    sticker_emojis = storage.telegram_sticker_emojis(chat.get("id"))
+    if sticker_emojis:
+        lines.append("В этом чате доступны стикеры для эмодзи: " + " ".join(sticker_emojis) + ".")
+    lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji, например "👍". Сервер иногда отправит этот эмодзи или случайный стикер с ним из наборов этого чата. Сохрани обычный текстовый ответ как запасной вариант. Не используй для важных объяснений.')
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
@@ -1148,6 +1160,24 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     group_text_explicit = bool(action.get("group_text_explicit"))
     private_text_explicit = bool(action.get("private_text_explicit"))
     reaction_only = bool(reaction_emoji) and reply_to != "both" and not group_text_explicit and not private_text_explicit
+    expression_emoji = str(action.get("sticker_emoji") or "").strip()
+    if not expression_emoji and answer.strip() and len(answer.strip()) <= 16 and storage.telegram_sticker_ids(chat_id, answer.strip()):
+        expression_emoji = answer.strip()
+    if (expression_emoji and not reaction_only
+            and reply_to == ("private" if chat_type == "private" else "group")
+            and not group_text_explicit and not private_text_explicit
+            and not action.get("private_to_username") and not action.get("private_to_telegram_user_id")
+            and random.random() < TG_STICKER_REPLY_CHANCE):
+        sent, kind = send_telegram_expression(chat_id, expression_emoji, message_id)
+        if sent:
+            return {
+                "telegram_route": kind,
+                "telegram_group_sent": chat_type != "private",
+                "telegram_private_sent": chat_type == "private",
+                "telegram_reaction_sent": reaction_sent,
+                "telegram_text_suppressed": True,
+                "telegram_action_details": {**telegram_action_audit_details(action), "expression_emoji": expression_emoji},
+            }
     if chat_type == "private":
         private_text_to_send = str(action.get("private_text") or answer)
         explicit_private_target = bool(str(action.get("private_to_username") or "").strip() or str(action.get("private_to_telegram_user_id") or "").strip())
@@ -1301,6 +1331,48 @@ def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: 
         "Чтобы связать меня с desktop/Android, в приложении напиши /id, затем сюда отправь /link app_client_id.\n"
         f"Пока твой временный guest client_id: {client_id}."
     )
+
+
+def remember_telegram_sticker(chat_id: object, sticker: dict[str, object]) -> None:
+    set_name = str(sticker.get("set_name") or "").strip()
+    stickers = [sticker]
+    if set_name and not storage.telegram_sticker_set_known(chat_id, set_name):
+        try:
+            from app.telegram_moderation import api_call
+            sticker_set = api_call(TG_BOT_API_KEY, "getStickerSet", {"name": set_name})
+            if isinstance(sticker_set, dict) and isinstance(sticker_set.get("stickers"), list):
+                stickers = [
+                    {**item, "set_name": set_name}
+                    for item in sticker_set["stickers"]
+                    if isinstance(item, dict)
+                ]
+                stickers.append(sticker)
+        except Exception as error:
+            audit_event("telegram_sticker_set_failed", chat_id=chat_id, set_name=set_name, error_type=type(error).__name__)
+    if stickers == [sticker] and set_name:
+        stickers = [{**sticker, "set_name": ""}]
+    count = storage.save_telegram_stickers(chat_id, stickers)
+    audit_event("telegram_stickers_saved", chat_id=chat_id, set_name=set_name, count=count)
+
+
+def send_telegram_expression(chat_id: object, emoji: str, message_id: object | None = None) -> tuple[bool, str]:
+    sticker_ids = storage.telegram_sticker_ids(chat_id, emoji)
+    if sticker_ids and random.random() < 0.75:
+        try:
+            from app.telegram_moderation import api_call
+            payload: dict[str, object] = {"chat_id": chat_id, "sticker": random.choice(sticker_ids)}
+            if message_id is not None:
+                payload["reply_parameters"] = {"message_id": message_id, "allow_sending_without_reply": True}
+            api_call(TG_BOT_API_KEY, "sendSticker", payload)
+            return True, "sticker"
+        except Exception as error:
+            audit_event("telegram_sticker_send_failed", chat_id=chat_id, error_type=type(error).__name__)
+    try:
+        send_telegram_message(chat_id, emoji)
+        return True, "emoji"
+    except Exception as error:
+        audit_event("telegram_emoji_send_failed", chat_id=chat_id, error_type=type(error).__name__)
+        return False, ""
 
 
 def send_telegram_message(chat_id: object, text: str, persona: str = "") -> None:
