@@ -1164,7 +1164,7 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     if not expression_emoji and answer.strip() and len(answer.strip()) <= 16 and storage.telegram_sticker_ids(chat_id, answer.strip()):
         expression_emoji = answer.strip()
     if (expression_emoji and not reaction_only
-            and reply_to == ("private" if chat_type == "private" else "group")
+            and (chat_type == "private" or reply_to == "group")
             and not group_text_explicit and not private_text_explicit
             and not action.get("private_to_username") and not action.get("private_to_telegram_user_id")
             and random.random() < TG_STICKER_REPLY_CHANCE):
