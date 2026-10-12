@@ -36,6 +36,7 @@ from app.smart_memory import (
 )
 from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
+from app.pot_provider import prepare_async as prepare_pot_provider_async
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("ASSISTANT_PORT") or os.getenv("PORT") or "8000")
@@ -1784,6 +1785,7 @@ def ensure_telegram_reaction_subscription() -> None:
 def main() -> None:
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
+    prepare_pot_provider_async()
     scheduler_stop, _ = start_timed_memory_scheduler()
     Thread(target=ensure_telegram_reaction_subscription, name="telegram-reactions-setup", daemon=True).start()
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)

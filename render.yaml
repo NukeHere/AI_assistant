@@ -3,7 +3,7 @@ services:
     name: ai-assistant-core
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python scripts/install_pot_provider.py
     startCommand: python simple_server.py
     envVars:
       - key: ASSISTANT_HOST

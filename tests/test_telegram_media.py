@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import base64
+import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,6 +52,28 @@ class TelegramMediaTests(unittest.TestCase):
         info["formats"][1]["filesize"] = 3_000_000
         self.assertEqual(telegram_media.format_candidates(info), ["video+audio"])
 
+    def test_non_mp4_source_is_transcoded_to_telegram_mp4(self):
+        import imageio_ffmpeg
+
+        info = {"duration": 2, "formats": [{
+            "format_id": "webm", "ext": "webm", "height": 360,
+            "vcodec": "vp9", "acodec": "opus", "filesize": 1_000_000,
+        }]}
+        self.assertEqual(telegram_media.format_candidates(info), [])
+        self.assertEqual(telegram_media.transcode_candidates(info), ["webm"])
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "video.webm"
+            subprocess.run([
+                imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=2",
+                "-c:v", "libvpx", "-y", str(source),
+            ], check=True, timeout=30)
+            with patch.object(telegram_media, "stop_pot_provider"):
+                output = telegram_media._transcode(source, 2, time.monotonic() + 60)
+            self.assertEqual(output.suffix, ".mp4")
+            self.assertGreater(output.stat().st_size, 0)
+            self.assertLessEqual(output.stat().st_size, telegram_media.MAX_VIDEO_BYTES)
+
     def test_download_retries_lower_quality_when_actual_size_is_too_large(self):
         info = {"formats": [
             {"format_id": "720", "ext": "mp4", "height": 720, "vcodec": "avc1", "acodec": "mp4a", "filesize_approx": 40_000_000},
@@ -73,7 +97,7 @@ class TelegramMediaTests(unittest.TestCase):
         self_outer = self
         attempted = []
 
-        def fake_download(_url, format_id, directory, _deadline, _cookie_file):
+        def fake_download(_url, format_id, directory, _deadline, _cookie_file, _extra_options):
             attempted.append(format_id)
             if format_id == "720":
                 raise telegram_media.MediaTooLarge("oversized")
@@ -85,6 +109,83 @@ class TelegramMediaTests(unittest.TestCase):
             temporary, video = telegram_media.download_video("https://youtu.be/abc123")
         try:
             self.assertEqual(attempted, ["720", "360"])
+            self.assertEqual(video.read_bytes(), b"video")
+        finally:
+            temporary.cleanup()
+
+    def test_download_uses_transcoder_when_only_large_source_exists(self):
+        info = {"duration": 120, "formats": [{
+            "format_id": "large", "ext": "webm", "height": 720,
+            "vcodec": "vp9", "acodec": "opus", "filesize": 80_000_000,
+        }]}
+
+        class FakeDownloader:
+            def __init__(self, _options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def extract_info(self, _url, download=False):
+                return info
+
+        def fake_download(_url, format_id, directory, _deadline, _cookie_file, _extra_options, max_bytes):
+            self.assertEqual(format_id, "large")
+            self.assertGreater(max_bytes, 80_000_000)
+            source = directory / "video.webm"
+            source.write_bytes(b"source")
+            return source
+
+        def fake_transcode(source, duration, _deadline):
+            self.assertEqual(duration, 120)
+            output = source.parent / "compressed.mp4"
+            output.write_bytes(b"compressed")
+            return output
+
+        with patch("yt_dlp.YoutubeDL", FakeDownloader), patch.object(telegram_media, "_download_one", side_effect=fake_download), patch.object(telegram_media, "_transcode", side_effect=fake_transcode):
+            temporary, video = telegram_media.download_video("https://youtu.be/abc123")
+        try:
+            self.assertEqual(video.read_bytes(), b"compressed")
+        finally:
+            temporary.cleanup()
+
+    def test_youtube_retries_with_pot_provider_after_metadata_failure(self):
+        info = {"formats": [{
+            "format_id": "small", "ext": "mp4", "height": 360,
+            "vcodec": "avc1", "acodec": "mp4a", "filesize": 1000,
+        }]}
+        profiles = []
+
+        class FakeDownloader:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def extract_info(self, _url, download=False):
+                profiles.append(self.options.get("extractor_args"))
+                if len(profiles) == 1:
+                    raise RuntimeError("Sign in to confirm you're not a bot")
+                return info
+
+        def fake_download(_url, _format_id, directory, _deadline, _cookie_file, extra_options):
+            self.assertIn("extractor_args", extra_options)
+            video = directory / "video.mp4"
+            video.write_bytes(b"video")
+            return video
+
+        with patch("yt_dlp.YoutubeDL", FakeDownloader), patch.object(telegram_media, "ensure_pot_provider", return_value=True), patch.object(telegram_media, "_download_one", side_effect=fake_download):
+            temporary, video = telegram_media.download_video("https://youtube.com/shorts/abc")
+        try:
+            self.assertEqual(profiles[0], None)
+            self.assertEqual(profiles[1]["youtube"]["player_client"][0], "mweb")
             self.assertEqual(video.read_bytes(), b"video")
         finally:
             temporary.cleanup()

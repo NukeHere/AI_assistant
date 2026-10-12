@@ -7,6 +7,8 @@ import base64
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -14,10 +16,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from app.pot_provider import ensure_started as ensure_pot_provider, stop_if_owned as stop_pot_provider
+
 
 # Telegram's hosted Bot API accepts uploads up to 50 MB. Leave room below it.
 MAX_VIDEO_BYTES = 45_000_000
-MAX_TEMP_BYTES = 90_000_000
+MAX_SOURCE_BYTES = 240_000_000
+MIN_FREE_DISK_BYTES = 80_000_000
 MAX_DOWNLOAD_SECONDS = 8 * 60
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -56,6 +61,15 @@ def _source_error(url: str, error: Exception) -> MediaError:
         if "sign in to confirm" in message or "not a bot" in message or "failed to extract any player response" in message:
             return MediaError("YouTube не отдал данные ролика серверу бота. Возможно, запросы с Render ограничены проверкой доступа.")
     return MediaError("Не удалось открыть видео. Оно может быть приватным или недоступным без входа.")
+
+
+def _pot_options(url: str) -> dict[str, object]:
+    host = (urlsplit(url).hostname or "").lower()
+    if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}:
+        return {}
+    if not ensure_pot_provider():
+        return {}
+    return {"extractor_args": {"youtube": {"player_client": ["mweb", "web_safari", "android_vr"]}}}
 
 
 def find_video_url(text: str) -> str | None:
@@ -109,11 +123,13 @@ def format_candidates(info: dict[str, object], max_bytes: int = MAX_VIDEO_BYTES)
             continue
         video = item.get("vcodec") not in (None, "none")
         audio = item.get("acodec") not in (None, "none")
-        if video and audio and item.get("ext") == "mp4":
+        compatible_video = str(item.get("vcodec") or "").startswith("avc1")
+        compatible_audio = str(item.get("acodec") or "").startswith("mp4a")
+        if video and audio and item.get("ext") == "mp4" and compatible_video and compatible_audio:
             progressive.append(item)
-        elif video and not audio and item.get("ext") == "mp4":
+        elif video and not audio and item.get("ext") == "mp4" and compatible_video:
             video_only.append(item)
-        elif audio and not video and item.get("ext") in {"m4a", "mp4"}:
+        elif audio and not video and item.get("ext") in {"m4a", "mp4"} and compatible_audio:
             audio_only.append(item)
 
     # A modest audio stream leaves the most space for video.
@@ -139,7 +155,39 @@ def format_candidates(info: dict[str, object], max_bytes: int = MAX_VIDEO_BYTES)
     return list(dict.fromkeys(choice[2] for choice in choices))
 
 
-def _download_one(url: str, format_id: str, directory: Path, deadline: float, cookie_file: Path | None = None) -> Path:
+def transcode_candidates(info: dict[str, object]) -> list[str]:
+    """Choose bounded source streams when a ready-to-send MP4 is unavailable."""
+    formats = [item for item in (info.get("formats") or []) if isinstance(item, dict)]
+    duration = info.get("duration")
+    videos = [item for item in formats if item.get("format_id") and not item.get("has_drm")
+              and item.get("vcodec") not in (None, "none")]
+    audios = [item for item in formats if item.get("format_id") and not item.get("has_drm")
+              and item.get("vcodec") in (None, "none") and item.get("acodec") not in (None, "none")]
+    audios.sort(key=lambda item: _size(item, duration) or MAX_SOURCE_BYTES)
+    choices = []
+    for video in videos:
+        if int(video.get("height") or 0) > 1080:
+            continue
+        audio = None if video.get("acodec") not in (None, "none") else (audios[0] if audios else None)
+        if video.get("acodec") in (None, "none") and audio is None:
+            continue
+        size = _size(video, duration)
+        audio_size = _size(audio, duration) if audio else 0
+        if size is not None and audio_size is not None and size + audio_size > MAX_SOURCE_BYTES:
+            continue
+        selector = str(video["format_id"])
+        if audio:
+            selector += f"+{audio['format_id']}"
+        choices.append((int(video.get("height") or 0), size is not None, selector))
+    choices.sort(reverse=True)
+    return list(dict.fromkeys(choice[2] for choice in choices))
+
+
+def _download_one(
+    url: str, format_id: str, directory: Path, deadline: float,
+    cookie_file: Path | None = None, extra_options: dict[str, object] | None = None,
+    max_bytes: int = MAX_VIDEO_BYTES,
+) -> Path:
     import deno
     import imageio_ffmpeg
     import yt_dlp
@@ -153,13 +201,13 @@ def _download_one(url: str, format_id: str, directory: Path, deadline: float, co
             return
         filename = str(status.get("filename") or "current")
         downloaded[filename] = int(status.get("downloaded_bytes") or 0)
-        if downloaded[filename] > MAX_VIDEO_BYTES or sum(downloaded.values()) > MAX_TEMP_BYTES:
-            raise MediaTooLarge("Файл превысил лимит Telegram.")
+        if downloaded[filename] > max_bytes or sum(downloaded.values()) > max_bytes:
+            raise MediaTooLarge("Исходный файл слишком велик для обработки на сервере.")
 
     options = {
         "format": format_id,
         "outtmpl": str(directory / "video.%(ext)s"),
-        "merge_output_format": "mp4",
+        "merge_output_format": "mkv" if max_bytes > MAX_VIDEO_BYTES else "mp4",
         "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         "js_runtimes": {"deno": {"path": deno.find_deno_bin()}},
         "noplaylist": True,
@@ -172,6 +220,7 @@ def _download_one(url: str, format_id: str, directory: Path, deadline: float, co
         "socket_timeout": 20,
         "progress_hooks": [progress],
     }
+    options.update(extra_options or {})
     if cookie_file is not None:
         options["cookiefile"] = str(cookie_file)
     proxy = os.getenv("YT_DLP_PROXY_URL", "").strip()
@@ -179,12 +228,52 @@ def _download_one(url: str, format_id: str, directory: Path, deadline: float, co
         options["proxy"] = proxy
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.extract_info(url, download=True)
-    video = directory / "video.mp4"
-    if not video.is_file():
-        raise MediaError("Видео в формате MP4 недоступно.")
-    if video.stat().st_size > MAX_VIDEO_BYTES:
-        raise MediaTooLarge("Видео превышает лимит Telegram.")
+    outputs = [path for path in directory.glob("video.*") if path.is_file() and path.suffix not in {".part", ".ytdl"}]
+    if len(outputs) != 1:
+        raise MediaError("Загрузка видео не завершилась.")
+    video = outputs[0]
+    if video.stat().st_size > max_bytes:
+        raise MediaTooLarge("Исходный файл слишком велик для обработки на сервере.")
     return video
+
+
+def _transcode(source: Path, duration: object, deadline: float) -> Path:
+    """Stream a source file through FFmpeg into a Telegram-sized H.264/AAC MP4."""
+    import imageio_ffmpeg
+
+    if not isinstance(duration, (int, float)) or duration <= 0:
+        raise MediaError("Не удалось определить длительность видео для сжатия.")
+    if duration > 60 * 60:
+        raise MediaTooLarge("Видео слишком длинное для обработки на сервере.")
+    stop_pot_provider()  # Release its Deno process before FFmpeg uses memory.
+    output = source.parent / "compressed.mp4"
+    remaining = max(1, int(deadline - time.monotonic()))
+    if remaining <= 1:
+        raise MediaError("Время обработки видео истекло.")
+    audio_bitrate = 96_000
+    for ratio in (0.90, 0.72):
+        output.unlink(missing_ok=True)
+        target_bits = int(MAX_VIDEO_BYTES * ratio * 8 / duration)
+        video_bitrate = max(80_000, target_bits - audio_bitrate)
+        command = [
+            imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-c:v", "libx264", "-preset", "veryfast", "-threads", "1",
+            "-b:v", str(video_bitrate), "-maxrate", str(video_bitrate), "-bufsize", str(video_bitrate * 2),
+            "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-y", str(output),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=max(1, int(deadline - time.monotonic())))
+        except subprocess.TimeoutExpired as error:
+            output.unlink(missing_ok=True)
+            raise MediaError("Время сжатия видео истекло.") from error
+        if result.returncode != 0:
+            output.unlink(missing_ok=True)
+            raise MediaError("Не удалось преобразовать видео в MP4.")
+        if output.stat().st_size <= MAX_VIDEO_BYTES:
+            return output
+    output.unlink(missing_ok=True)
+    raise MediaTooLarge("Видео не удалось сжать до размера, допустимого Telegram.")
 
 
 def download_video(url: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
@@ -193,43 +282,68 @@ def download_video(url: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     import yt_dlp
 
     deadline = time.monotonic() + MAX_DOWNLOAD_SECONDS
-    metadata_options = {
-        "noplaylist": True,
-        "skip_download": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 0,
-        "extractor_retries": 0,
-        "socket_timeout": 12,
-        "js_runtimes": {"deno": {"path": deno.find_deno_bin()}},
-    }
+    last_error: Exception | None = None
     with _cookie_file() as cookie_file:
-        if cookie_file is not None:
-            metadata_options["cookiefile"] = str(cookie_file)
-        proxy = os.getenv("YT_DLP_PROXY_URL", "").strip()
-        if proxy:
-            metadata_options["proxy"] = proxy
-        try:
-            with yt_dlp.YoutubeDL(metadata_options) as downloader:
-                info = downloader.extract_info(url, download=False)
-        except Exception as error:
-            raise _source_error(url, error) from error
-        if not isinstance(info, dict) or info.get("entries") is not None or info.get("is_live"):
-            raise MediaError("Поддерживаются только отдельные опубликованные видео, не эфиры и не плейлисты.")
-        candidates = format_candidates(info)
-        if not candidates:
-            raise MediaError("Нет подходящего формата MP4 размером до 45 МБ.")
-        last_error: Exception | None = None
-        for format_id in candidates[:6]:
+        for attempt in range(2):
+            extra_options = {} if attempt == 0 else _pot_options(url)
+            if attempt == 1 and not extra_options:
+                break
+            metadata_options = {
+                "noplaylist": True,
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": True,
+                "retries": 0,
+                "extractor_retries": 0,
+                "socket_timeout": 12,
+                "js_runtimes": {"deno": {"path": deno.find_deno_bin()}},
+                **extra_options,
+            }
+            if cookie_file is not None:
+                metadata_options["cookiefile"] = str(cookie_file)
+            proxy = os.getenv("YT_DLP_PROXY_URL", "").strip()
+            if proxy:
+                metadata_options["proxy"] = proxy
+            try:
+                with yt_dlp.YoutubeDL(metadata_options) as downloader:
+                    info = downloader.extract_info(url, download=False)
+            except Exception as error:
+                last_error = _source_error(url, error)
+                continue
+            if not isinstance(info, dict) or info.get("entries") is not None or info.get("is_live"):
+                raise MediaError("Поддерживаются только отдельные опубликованные видео, не эфиры и не плейлисты.")
+            candidates = format_candidates(info)
+            for format_id in candidates[:6 if attempt == 0 else 3]:
+                if time.monotonic() > deadline:
+                    break
+                temporary = tempfile.TemporaryDirectory(prefix="assistant-video-")
+                try:
+                    video = _download_one(url, format_id, Path(temporary.name), deadline, cookie_file, extra_options)
+                    return temporary, video
+                except Exception as error:
+                    last_error = error
+                    temporary.cleanup()
+            # Keep both the source and output on disk with space to spare for merging.
+            free_disk = shutil.disk_usage(tempfile.gettempdir()).free
+            source_limit = min(MAX_SOURCE_BYTES, (free_disk - MIN_FREE_DISK_BYTES - MAX_VIDEO_BYTES) // 2)
+            if source_limit <= MAX_VIDEO_BYTES:
+                last_error = MediaTooLarge("На сервере недостаточно места для сжатия видео.")
+                continue
+            for format_id in transcode_candidates(info)[:2]:
+                if time.monotonic() > deadline:
+                    break
+                temporary = tempfile.TemporaryDirectory(prefix="assistant-video-")
+                try:
+                    source = _download_one(url, format_id, Path(temporary.name), deadline, cookie_file, extra_options, source_limit)
+                    video = _transcode(source, info.get("duration"), deadline)
+                    return temporary, video
+                except Exception as error:
+                    last_error = error
+                    temporary.cleanup()
             if time.monotonic() > deadline:
                 break
-            temporary = tempfile.TemporaryDirectory(prefix="assistant-video-")
-            try:
-                video = _download_one(url, format_id, Path(temporary.name), deadline, cookie_file)
-                return temporary, video
-            except Exception as error:
-                last_error = error
-                temporary.cleanup()
+    if isinstance(last_error, MediaError):
+        raise last_error
     raise MediaError("Не удалось скачать видео в пределах 45 МБ. Попробуй более короткий ролик.") from last_error
 
 
@@ -273,7 +387,10 @@ def send_video(chat_id: object, message_id: object | None, video: Path, token: s
 
 
 def download_and_send(url: str, chat_id: object, message_id: object | None, token: str) -> None:
-    temporary, video = download_video(url)
+    try:
+        temporary, video = download_video(url)
+    finally:
+        stop_pot_provider()
     try:
         send_video(chat_id, message_id, video, token)
     finally:
