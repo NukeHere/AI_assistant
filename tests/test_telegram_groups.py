@@ -40,6 +40,14 @@ class GroupTests(unittest.TestCase):
             send.assert_not_called()
             react.assert_not_called()
 
+    def test_ignore_after_explanation_is_not_sent_to_group(self):
+        raw = 'We should ignore as no direct question or request.{\n"telegram_action": {\n"reply_to": "ignore"\n}\n}'
+        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", return_value=(raw, "mock")), patch.object(server, "send_telegram_message") as send, patch.object(server, "try_set_telegram_reaction") as react:
+            result = server.handle_telegram_update(telegram_update("бот, просто проверка", "supergroup"))
+            self.assertEqual(result["telegram_route"], "ignore")
+            send.assert_not_called()
+            react.assert_not_called()
+
     def test_removed_reaction_is_visible_in_group_history(self):
         with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True):
             server.handle_telegram_reaction_update({"chat": {"id": -123, "type": "supergroup"}, "message_id": 7, "user": {"id": 777, "username": "user_name"}, "old_reaction": [{"type": "emoji", "emoji": "👍"}], "new_reaction": []})
