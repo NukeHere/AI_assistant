@@ -658,7 +658,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     is_own_command = is_telegram_command_for_this_bot(telegram_command, chat_type)
     command_name = str(telegram_command.get("command") or "") if is_own_command else ""
     command_args = str(telegram_command.get("args") or "") if is_own_command else ""
-    command_text = normalize_telegram_command(text) if is_own_command or telegram_command is None else text.strip()
+    command_text = (normalize_telegram_command(text) if is_own_command or telegram_command is None else text.strip()) or text.strip()
     linked_client_id, is_authorized = storage.telegram_client_context(telegram_user_id)
     is_authorized = is_authorized or TG_OPEN_ACCESS
     audit_event(
@@ -756,7 +756,10 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         "text": user_text,
         "history_text": f"[Telegram id={telegram_user_id} @{username}] {user_text}" if chat_type != "private" else user_text,
         "channel": "telegram_group" if chat_type != "private" else "telegram",
-        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode),
+        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode) + (
+            "\nТекущее сообщение адресовано тебе напрямую (обращение, @упоминание или ответ на твоё сообщение). Ответь отправителю; если это только вызов по имени, кратко подтверди, что ты здесь. Не выбирай ignore только из-за отсутствия вопроса."
+            if chat_type in {"group", "supergroup"} and (addressed or reply_to_bot) else ""
+        ),
     })
     action = payload.get("telegram_action") or {}
     if isinstance(action, dict) and (action.get("mute") or action.get("unmute")):
