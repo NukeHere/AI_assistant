@@ -83,7 +83,7 @@ class ChatApp(tk.Tk):
 
         self.results: queue.Queue[tuple[str, object]] = queue.Queue()
         self.client_id = CLIENT_ID
-        self.persona = "ANA"
+        self.persona = "FRIEND"
         self.chat_log = self._load_local_history()
         self.notified_timer_ids = self._load_notified_timer_ids()
         self._sync_running = False
@@ -92,6 +92,7 @@ class ChatApp(tk.Tk):
         quick.pack(fill=tk.X, padx=12, pady=(8, 0))
         tk.Button(quick, text="Sync", command=self._sync_history_async).pack(side=tk.LEFT)
         tk.Button(quick, text="↓ вниз", command=self._scroll_to_bottom).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(quick, text="FRIEND", command=lambda: self._send_quick("/friend")).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(quick, text="ANA", command=lambda: self._send_quick("/ana")).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(quick, text="ALIEN", command=lambda: self._send_quick("/alien")).pack(side=tk.LEFT, padx=(6, 0))
         tk.Button(quick, text="Память", command=lambda: self._send_quick("/memory")).pack(side=tk.LEFT, padx=(6, 0))
@@ -138,7 +139,7 @@ class ChatApp(tk.Tk):
             self._render_history()
             self._append_system("Локальная история восстановлена. Сверяю с сервером.")
         else:
-            self._append_system("Готово. Режим по умолчанию: ANA. Команды: /ana, /alien, запомни: ..., /memory, /timers, /functions.")
+            self._append_system("Готово. Режим по умолчанию: FRIEND. Команды: /friend, /ana, /alien, запомни: ..., /memory, /timers, /functions.")
         self.after(100, self._poll_results)
         self.after(150, self._register_client_async)
         self.after(200, self._sync_history_async)
@@ -681,7 +682,7 @@ class ChatApp(tk.Tk):
         self.history.configure(state=tk.NORMAL)
         author_tag = self._author_tag(author)
         self.history.insert(tk.END, f"{author}:\n", ("author", author_tag))
-        if author in {"ANA", "ALIEN"}:
+        if author in {"FRIEND", "ANA", "ALIEN"}:
             self._insert_assistant_text(author, text)
         else:
             self.history.insert(tk.END, f"{text}\n\n", (author_tag,))
@@ -719,7 +720,7 @@ class ChatApp(tk.Tk):
     def _role_for_author(self, author: str) -> str:
         if author == "Вы":
             return "user"
-        if author in {"ANA", "ALIEN"}:
+        if author in {"FRIEND", "ANA", "ALIEN"}:
             return "assistant"
         return "system"
 
@@ -727,7 +728,7 @@ class ChatApp(tk.Tk):
         if role == "user":
             return "Вы"
         if role == "assistant":
-            return persona if persona in {"ANA", "ALIEN"} else "ANA"
+            return persona if persona in {"FRIEND", "ANA", "ALIEN"} else "FRIEND"
         return "Система"
 
     def _author_tag(self, author: str) -> str:

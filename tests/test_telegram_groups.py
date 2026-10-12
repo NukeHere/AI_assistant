@@ -104,6 +104,21 @@ class GroupTests(unittest.TestCase):
 
 
 class ModerationTests(unittest.TestCase):
+    def test_creator_id_cannot_be_muted_even_if_username_changed(self):
+        with patch.dict("os.environ", {"TG_CREATOR_USER_ID": ""}), patch.object(moderation, "api_call") as api:
+            result = moderation.execute_mute(-123, "supergroup", {"user_id": "1834373176", "minutes": 1, "reason": "флуд"}, "test")
+        self.assertFalse(result["success"])
+        self.assertIn("создатель", result["text"])
+        api.assert_not_called()
+
+    def test_creator_current_username_cannot_be_muted_without_configured_id(self):
+        replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True},
+                   {"status": "member", "user": {"id": 777, "username": "Ne_gr_idi_rabotai"}}]
+        with patch.dict("os.environ", {"TG_CREATOR_USER_ID": ""}), patch.object(moderation, "api_call", side_effect=replies) as api:
+            result = moderation.execute_mute(-123, "supergroup", {"user_id": "777", "minutes": 1, "reason": "флуд"}, "test")
+        self.assertFalse(result["success"])
+        self.assertFalse(any(call.args[1] == "restrictChatMember" for call in api.call_args_list))
+
     def test_unmute_releases_restricted_member(self):
         replies = [{"id": 99}, {"status": "administrator", "can_restrict_members": True}, {"status": "restricted", "is_member": True, "user": {"id": 777, "username": "user_name"}}, True]
         with patch.object(moderation, "api_call", side_effect=replies) as api:

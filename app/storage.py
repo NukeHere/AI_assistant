@@ -33,7 +33,7 @@ class Storage:
                 create table if not exists conversations (
                     id text primary key,
                     client_id text not null,
-                    persona text not null default 'ANA',
+                    persona text not null default 'FRIEND',
                     alien_glossary_json text not null default '{}',
                     created_at text not null default current_timestamp,
                     updated_at text not null default current_timestamp
@@ -120,6 +120,32 @@ class Storage:
 
                 create index if not exists idx_telegram_stickers_chat_emoji
                     on telegram_stickers (chat_id, emoji);
+                create table if not exists telegram_group_messages (
+                    chat_id text not null,
+                    message_id text not null,
+                    user_id text not null,
+                    username text not null default '',
+                    display_name text not null default '',
+                    content text not null,
+                    sent_at text not null,
+                    primary key (chat_id, message_id)
+                );
+                create index if not exists idx_telegram_group_messages_day
+                    on telegram_group_messages (sent_at, chat_id);
+                create table if not exists telegram_daily_summaries (
+                    chat_id text not null,
+                    day text not null,
+                    sent_at text not null default current_timestamp,
+                    primary key (chat_id, day)
+                );
+                create table if not exists telegram_summary_requests (
+                    chat_id text not null,
+                    message_id text not null,
+                    primary key (chat_id, message_id)
+                );
+                create table if not exists schema_migrations (
+                    name text primary key
+                );
                 """
             )
             self._ensure_column(conn, "memory_cells", "embedding_json", "text not null default '[]'")
@@ -131,6 +157,73 @@ class Storage:
             conn.execute("create index if not exists idx_messages_conversation_created on messages (conversation_id, created_at, id)")
             self._ensure_column(conn, "timed_memories", "timer_uid", "text")
             self._ensure_column(conn, "timed_memories", "materialized_message_uid", "text")
+            if conn.execute("select 1 from schema_migrations where name = 'friend_default'").fetchone() is None:
+                conn.execute("""update conversations set persona = 'FRIEND'
+                                where persona = 'ANA' and not exists (
+                                    select 1 from messages where conversation_id = conversations.id
+                                      and role = 'user' and (
+                                          lower(content) like '%/ana%' or
+                                          lower(content) like '%переключись на ана%' or
+                                          lower(content) like '%говори как ана%' or
+                                          lower(content) like '%верни ана%'
+                                      )
+                                )""")
+                conn.execute("insert into schema_migrations(name) values ('friend_default')")
+
+    def claim_telegram_summary_request(self, chat_id: object, message_id: object) -> bool:
+        with self._lock, self._connect() as conn:
+            result = conn.execute(
+                "insert or ignore into telegram_summary_requests(chat_id, message_id) values (?, ?)",
+                (str(chat_id), str(message_id)),
+            )
+            return result.rowcount == 1
+
+    def release_telegram_summary_request(self, chat_id: object, message_id: object) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("delete from telegram_summary_requests where chat_id = ? and message_id = ?",
+                         (str(chat_id), str(message_id)))
+
+    def record_telegram_group_message(self, chat_id: object, message_id: object, user_id: object,
+                                      username: str, display_name: str, content: str, sent_at: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """insert into telegram_group_messages
+                   (chat_id, message_id, user_id, username, display_name, content, sent_at)
+                   values (?, ?, ?, ?, ?, ?, ?)
+                   on conflict(chat_id, message_id) do update set
+                   username=excluded.username, display_name=excluded.display_name,
+                   content=excluded.content""",
+                (str(chat_id), str(message_id), str(user_id), username[:128], display_name[:128], content[:4000], sent_at),
+            )
+
+    def telegram_group_messages_between(self, chat_id: object, start: str, end: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """select user_id, username, display_name, content, sent_at
+                   from telegram_group_messages
+                   where chat_id = ? and sent_at >= ? and sent_at < ?
+                   order by sent_at, cast(message_id as integer)""",
+                (str(chat_id), start, end),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def telegram_group_chats_between(self, start: str, end: str) -> list[str]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """select distinct chat_id from telegram_group_messages
+                   where sent_at >= ? and sent_at < ?""", (start, end),
+            ).fetchall()
+        return [str(row["chat_id"]) for row in rows]
+
+    def telegram_daily_summary_sent(self, chat_id: object, day: str) -> bool:
+        with self._lock, self._connect() as conn:
+            return conn.execute("select 1 from telegram_daily_summaries where chat_id = ? and day = ?",
+                                (str(chat_id), day)).fetchone() is not None
+
+    def mark_telegram_daily_summary_sent(self, chat_id: object, day: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("insert or ignore into telegram_daily_summaries (chat_id, day) values (?, ?)",
+                         (str(chat_id), day))
 
     def save_telegram_stickers(self, chat_id: object, stickers: list[dict[str, object]]) -> int:
         rows = []
@@ -200,7 +293,7 @@ class Storage:
             if row is None:
                 conn.execute(
                     "insert into conversations (id, client_id, persona) values (?, ?, ?)",
-                    (conversation_id, client_id, Persona.ANA.value),
+                    (conversation_id, client_id, Persona.FRIEND.value),
                 )
                 row = conn.execute(
                     "select * from conversations where id = ?",
@@ -686,9 +779,9 @@ class Storage:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 conversation_id = str(item["id"])
-                persona = str(item.get("persona") or Persona.ANA.value)
-                if persona not in {Persona.ANA.value, Persona.ALIEN.value}:
-                    persona = Persona.ANA.value
+                persona = str(item.get("persona") or Persona.FRIEND.value)
+                if persona not in {persona.value for persona in Persona}:
+                    persona = Persona.FRIEND.value
                 glossary = str(item.get("alien_glossary_json") or "{}")
                 conn.execute(
                     """
@@ -729,7 +822,7 @@ class Storage:
                     values (?, ?, ?)
                     on conflict(id) do nothing
                     """,
-                    (conversation_id, client_id, Persona.ANA.value),
+                    (conversation_id, client_id, Persona.FRIEND.value),
                 )
                 content_hash = self.message_hash(conversation_id, role, content)
                 if not message_uid:

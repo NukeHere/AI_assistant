@@ -227,7 +227,7 @@ class SimpleServerTests(unittest.TestCase):
                 {"client_id": "primary-user", "conversation_id": "history-test", "limit": 10}
             )
 
-        self.assertEqual(history["persona"], "ANA")
+        self.assertEqual(history["persona"], "FRIEND")
         self.assertGreaterEqual(len(history["messages"]), 2)
         self.assertEqual(history["messages"][0]["role"], "user")
 

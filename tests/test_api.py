@@ -52,7 +52,7 @@ def test_simple_chat_accepts_history() -> None:
     assert body["text"]
 
 
-def test_message_uses_default_ana() -> None:
+def test_message_uses_default_friend() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/v1/message",
@@ -62,7 +62,7 @@ def test_message_uses_default_ana() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["persona"] == "ANA"
+    assert body["persona"] == "FRIEND"
     assert body["switched"] is False
 
 

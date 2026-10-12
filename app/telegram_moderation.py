@@ -1,9 +1,11 @@
 """Bounded Telegram moderation; Telegram itself expires temporary restrictions."""
 import json
+import os
 import time
 from urllib.request import Request, urlopen
 
 _rights_cache = {}
+CREATOR_USER_ID = "1834373176"
 
 
 def api_call(token, method, payload):
@@ -42,6 +44,9 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None, *, unm
     minutes = action.get("minutes")
     if not target.isdecimal() or int(target) <= 0:
         return failed("неизвестен числовой ID участника")
+    extra_protected_id = os.getenv("TG_CREATOR_USER_ID", "").strip()
+    if not unmute and target in {CREATOR_USER_ID, extra_protected_id}:
+        return failed("создатель бота не подлежит муту")
     if not unmute and (type(minutes) is not int or minutes != 1):
         return failed("максимальный срок мута сейчас 1 минута; укажи minutes=1")
     reason = str(action.get("reason") or "").strip()[:300]
@@ -61,6 +66,8 @@ def execute_mute(chat_id, chat_type, action, token, lookup_username=None, *, unm
         if int(target) == cached[1]:
             return failed("нельзя ограничить самого бота")
         member = api_call(token, "getChatMember", {"chat_id": chat_id, "user_id": int(target)})
+        if not unmute and str((member.get("user") or {}).get("username") or "").lower() == "ne_gr_idi_rabotai":
+            return failed("создатель бота не подлежит муту")
         if username and str((member.get("user") or {}).get("username") or "").lower() != username:
             return failed("ник участника изменился; дождитесь его нового сообщения")
         if unmute and (member.get("status") != "restricted" or not member.get("is_member")):

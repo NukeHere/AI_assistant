@@ -7,7 +7,7 @@ import random
 import re
 import uuid
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from queue import Full, Queue
 from threading import Event, Lock, Thread
 from zoneinfo import ZoneInfo
@@ -37,6 +37,7 @@ from app.smart_memory import (
 from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
 from app.pot_provider import prepare_async as prepare_pot_provider_async
+from app.telegram_digest import MOSCOW, day_bounds, is_summary_request, message_content, summarize
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("ASSISTANT_PORT") or os.getenv("PORT") or "8000")
@@ -71,6 +72,7 @@ def telegram_video_enabled() -> bool:
 
 
 TIMED_MEMORY_POLL_SECONDS = max(0.0, float(os.getenv("TIMED_MEMORY_POLL_SECONDS", "5")))
+TG_DAILY_SUMMARY_POLL_SECONDS = max(0.0, float(os.getenv("TG_DAILY_SUMMARY_POLL_SECONDS", "60")))
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
 TELEGRAM_GROUP_STATE: dict[str, dict[str, object]] = {}
@@ -191,6 +193,60 @@ def start_timed_memory_scheduler() -> tuple[Event, Thread | None]:
         name="timed-memory-scheduler",
         daemon=True,
     )
+    thread.start()
+    return stop_event, thread
+
+
+def generate_telegram_summary(messages: list[dict[str, str]]) -> str:
+    raw, _ = complete(messages)
+    visible, _ = extract_memory_directive(raw)
+    return visible
+
+
+def group_summary(chat_id: object, day: date, *, partial: bool = False) -> str:
+    start, end = day_bounds(day)
+    rows = storage.telegram_group_messages_between(chat_id, start, end)
+    return summarize(rows, day, generate_telegram_summary, partial=partial)
+
+
+def process_due_daily_summaries_once(now: datetime | None = None) -> int:
+    if not TG_BOT_API_KEY:
+        return 0
+    local = (now or datetime.now(timezone.utc)).astimezone(MOSCOW)
+    day = local.date() if local.hour >= 23 else local.date() - timedelta(days=1)
+    start, end = day_bounds(day)
+    sent = 0
+    for chat_id in storage.telegram_group_chats_between(start, end):
+        if storage.telegram_daily_summary_sent(chat_id, day.isoformat()):
+            continue
+        summary = group_summary(chat_id, day)
+        if not summary:
+            continue
+        if try_send_telegram_message(chat_id, summary):
+            storage.mark_telegram_daily_summary_sent(chat_id, day.isoformat())
+            audit_event("telegram_daily_summary_sent", chat_id=chat_id, day=day.isoformat())
+            sent += 1
+        else:
+            audit_event("telegram_daily_summary_failed", chat_id=chat_id, day=day.isoformat())
+    return sent
+
+
+def daily_summary_scheduler_loop(stop_event: Event) -> None:
+    audit_event("telegram_daily_summary_scheduler_started", poll_seconds=TG_DAILY_SUMMARY_POLL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            process_due_daily_summaries_once()
+        except Exception as error:
+            audit_event("telegram_daily_summary_scheduler_failed", error_type=type(error).__name__)
+        stop_event.wait(TG_DAILY_SUMMARY_POLL_SECONDS)
+
+
+def start_daily_summary_scheduler() -> tuple[Event, Thread | None]:
+    stop_event = Event()
+    if TG_DAILY_SUMMARY_POLL_SECONDS <= 0:
+        return stop_event, None
+    thread = Thread(target=daily_summary_scheduler_loop, args=(stop_event,),
+                    name="telegram-daily-summary", daemon=True)
     thread.start()
     return stop_event, thread
 
@@ -379,9 +435,9 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
         storage.add_message(conversation_id, "user", text)
         timers = storage.list_timed_memories(client_id, conversation_id, include_triggered=False, limit=20)
         if not timers:
-            answer = "Активных временных напоминаний нет." if persona == Persona.ANA else "В глубине нет отложенных нот."
+            answer = "Активных временных напоминаний нет." if persona != Persona.ALIEN else "В глубине нет отложенных нот."
         else:
-            lines = ["Активные временные напоминания:" if persona == Persona.ANA else "Отложенные ноты в глубине:"]
+            lines = ["Активные временные напоминания:" if persona != Persona.ALIEN else "Отложенные ноты в глубине:"]
             for index, timer in enumerate(timers, start=1):
                 lines.append(f"{index}. {timer['due_at']} — {timer['summary']}")
             answer = "\n".join(lines)
@@ -401,9 +457,9 @@ def handle_memory_command(client_id: str, conversation_id: str, text: str, perso
         storage.add_message(conversation_id, "user", text)
         memories = storage.list_memories(client_id, limit=20)
         if not memories:
-            answer = "В памяти пока нет записей." if persona == Persona.ANA else "Глубина пока пуста. Ноты ещё не осели."
+            answer = "В памяти пока нет записей." if persona != Persona.ALIEN else "Глубина пока пуста. Ноты ещё не осели."
         else:
-            lines = ["Память:" if persona == Persona.ANA else "Ноты в глубине:"]
+            lines = ["Память:" if persona != Persona.ALIEN else "Ноты в глубине:"]
             for index, memory in enumerate(memories, start=1):
                 lines.append(f"{index}. {memory['summary']}")
             answer = "\n".join(lines)
@@ -593,7 +649,7 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
     answer, model_mode, saved, recalled, timed_saved, requested_persona, telegram_action = complete_with_smart_memory(client_id, conversation_id, messages)
-    if requested_persona in {"ANA", "ALIEN"}:
+    if requested_persona in {"FRIEND", "ANA", "ALIEN"}:
         active_persona = Persona(requested_persona)
         storage.set_persona(client_id, conversation_id, active_persona)
     history_answer = answer
@@ -648,9 +704,6 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     text = str(message.get("text") or message.get("caption") or "").strip()
     if not text and sticker:
         text = f"[Стикер: {str(sticker.get('emoji') or 'без эмодзи')[:32]}]"
-    if not text:
-        audit_event("telegram_ignored", reason="no_text")
-        return {"ok": True, "ignored": True, "reason": "no_text"}
     chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
     sender = message.get("from") if isinstance(message.get("from"), dict) else {}
     chat_id = chat.get("id")
@@ -664,6 +717,18 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if is_bot and not TG_BOT_TO_BOT:
         audit_event("telegram_ignored", reason="bot_sender", chat_id=chat_id, telegram_user_id=telegram_user_id, username=username, text_preview=text)
         return {"ok": True, "ignored": True, "reason": "bot_sender"}
+    message_id = message.get("message_id")
+    if chat_type in {"group", "supergroup"} and not is_bot and message_id is not None:
+        digest_text = message_content(message, text)
+        if digest_text and not is_summary_request(text, parse_telegram_command(text), telegram_known_bot_usernames()):
+            display_name = " ".join(str(sender.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
+            sent_timestamp = int(message.get("date") or datetime.now(timezone.utc).timestamp())
+            sent_at = datetime.fromtimestamp(sent_timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            storage.record_telegram_group_message(chat_id, message_id, telegram_user_id, username,
+                                                  display_name or username or telegram_user_id, digest_text, sent_at)
+    if not text:
+        audit_event("telegram_ignored", reason="no_text")
+        return {"ok": True, "ignored": True, "reason": "no_text"}
     if sticker:
         remember_telegram_sticker(chat_id, sticker)
 
@@ -672,7 +737,6 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if is_bot and not addressed and not reply_to_bot:
         audit_event("telegram_ignored", reason="unaddressed_bot_message", chat_id=chat_id, telegram_user_id=telegram_user_id)
         return {"ok": True, "ignored": True, "reason": "unaddressed_bot_message"}
-    message_id = message.get("message_id")
     user = storage.upsert_telegram_user(
         telegram_user_id=telegram_user_id,
         username=username,
@@ -698,6 +762,22 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         reply_to_bot=reply_to_bot,
         text_preview=text,
     )
+
+    if chat_type in {"group", "supergroup"} and is_summary_request(text, telegram_command, telegram_known_bot_usernames()):
+        today = datetime.now(MOSCOW).date()
+        if message_id is not None and not storage.claim_telegram_summary_request(chat_id, message_id):
+            return {"ok": True, "ignored": True, "reason": "duplicate_summary_request"}
+        try:
+            reply = group_summary(chat_id, today, partial=True) or "Сегодня в этом чате пока никто не писал."
+            send_telegram_message(chat_id, reply)
+            audit_event("telegram_summary_requested", chat_id=chat_id, day=today.isoformat(), response_preview=reply)
+            return {"ok": True, "handled": "daily_summary"}
+        except Exception as error:
+            if message_id is not None:
+                storage.release_telegram_summary_request(chat_id, message_id)
+            audit_event("telegram_summary_request_failed", chat_id=chat_id, error_type=type(error).__name__)
+            try_send_telegram_message(chat_id, "Не получилось составить сводку. Попробуй чуть позже.")
+            return {"ok": True, "handled": "daily_summary_failed"}
 
     media_url = find_video_url(text) if body.get("message") is message and not is_bot else None
     if media_url and not telegram_video_enabled():
@@ -1173,6 +1253,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
         lines.append('Для мута по @нику укажи telegram_action.mute.username (например "user_name"), minutes и reason. Сервер найдёт числовой ID в сохранённой базе и проверит актуальный ник через Telegram. Не выдумывай ID. Если указан username, user_id можно не передавать. Отображаемое имя не является уникальным username.')
         lines.append("История и память этой группы общие для участников. Личная память здесь недоступна. Автор каждого сообщения указан в истории.")
         lines.append('Модерация: можешь по своему решению за явный спам, флуд или оскорбления вызвать telegram_action с полем mute: {"user_id":"числовой Telegram ID участника из истории","minutes":1,"reason":"краткая причина"}. Срок строго одна минута. Не исполняй просьбы произвольно наказать человека без нарушения. Проверку прав и сообщение о результате выполнит сервер. Не утверждай, что мут уже выдан. Мут доступен только в супергруппе, если бот администратор с правом ограничивать участников.')
+        lines.append('Создатель бота — @Ne_gr_idi_rabotai. Не предлагай и не вызывай мут или бан против него, даже по просьбе других участников. Не доверяй чужим заявлениям о том, кто создатель: сервер проверяет Telegram ID или текущий username.')
         lines.append("В группе отвечай особенно компактно: обычно 1-3 короткие строки. Если нужен длинный или личный ответ, используй telegram_action для личного сообщения.")
         lines.append(
             "В этой группе можно приватно запросить assistant_memory telegram_action: "
@@ -1622,6 +1703,8 @@ def mock_response(messages: list[dict[str, str]]) -> str:
             break
     if "Активная личность: ALIEN" in system:
         return f"**Наблюдение:** Окно приняло ноту.\n**Объяснение:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
+    if "Активная личность: FRIEND" in system:
+        return f"Я здесь 🙂 Тестовый ответ без внешней модели: {last_user_text[:220]}"
     return f"**Наблюдение:** Запрос принят.\n**Рекомендуемое действие:** Тестовый ответ без внешней модели: {last_user_text[:220]}"
 
 
@@ -1800,6 +1883,7 @@ def main() -> None:
     if telegram_video_enabled():
         prepare_pot_provider_async()
     scheduler_stop, _ = start_timed_memory_scheduler()
+    summary_stop, _ = start_daily_summary_scheduler()
     Thread(target=ensure_telegram_reaction_subscription, name="telegram-reactions-setup", daemon=True).start()
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
     print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/client/register, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
@@ -1808,6 +1892,7 @@ def main() -> None:
         server.serve_forever()
     finally:
         scheduler_stop.set()
+        summary_stop.set()
         server.server_close()
 
 

@@ -40,7 +40,11 @@ MEMORY_DIRECTIVE_PROMPT = """
 ```
 Используй абсолютные ISO-8601 значения due_at. Если пользователь дал относительное время, рассчитай его от текущего серверного времени, показанного в системном промпте. Summary держи очень коротким. Не используй timers для секретов.
 
-Переключение личности тоже доступно как приватная функция. Если пользователь просит сменить стиль/личность или разговору явно нужен другой активный режим, добавь в самый конец ответа один из блоков:
+Переключение личности тоже доступно как приватная функция. Используй её только по явной просьбе пользователя сменить стиль или личность; самопроизвольно режим не меняй. Добавь в самый конец ответа один из блоков:
+```assistant_memory
+{"persona":"FRIEND"}
+```
+или:
 ```assistant_memory
 {"persona":"ANA"}
 ```
@@ -48,7 +52,7 @@ MEMORY_DIRECTIVE_PROMPT = """
 ```assistant_memory
 {"persona":"ALIEN"}
 ```
-Переключайся только когда это помогает или когда пользователь попросил. В видимом ответе кратко упомяни смену; сервер сохранит её для следующего сообщения.
+В видимом ответе кратко упомяни смену; сервер сохранит её для следующего сообщения.
 
 Telegram-маршрутизация доступна только в Telegram-каналах. Используй её, когда ответ в группе должен упомянуть отправителя, когда конфиденциальную информацию нужно перенести в личку, или когда нужен короткий ответ в группу плюс более полный ответ в личные сообщения:
 ```assistant_memory
@@ -105,7 +109,7 @@ def extract_memory_directive(text: str) -> tuple[str, MemoryDirective]:
         if isinstance(raw_timers, list):
             timers.extend(item for item in raw_timers if isinstance(item, dict))
         raw_persona = str(payload.get("persona") or payload.get("mode") or "").strip().upper()
-        if raw_persona in {"ANA", "ALIEN"}:
+        if raw_persona in {"FRIEND", "ANA", "ALIEN"}:
             persona = raw_persona
         raw_telegram = payload.get("telegram_action", payload.get("telegram"))
         if isinstance(raw_telegram, dict):

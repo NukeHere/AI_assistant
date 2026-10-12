@@ -58,7 +58,8 @@ class SyncAndBlocksTests(unittest.TestCase):
 
         self.assertIn("render_blocks", response)
         self.assertTrue(response["render_blocks"])
-        self.assertEqual(response["render_blocks"][0]["label"], "НАБЛЮДЕНИЕ")
+        self.assertEqual(response["render_blocks"][0]["type"], "text")
+        self.assertEqual(response["render_blocks"][0]["label"], "")
 
     def test_parse_render_blocks_hides_markdown_labels(self) -> None:
         blocks = parse_render_blocks("ALIEN", "**Observation:** Нота принята.\nОбычный текст")

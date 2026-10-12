@@ -76,7 +76,7 @@ public class MainActivity extends Activity {
     private TextView historyView;
     private EditText messageInput;
     private Button sendButton;
-    private String persona = "ANA";
+    private String persona = "FRIEND";
     private String clientId;
     private final List<JSONObject> events = new ArrayList<>();
     private final HashSet<String> notifiedTimerIds = new HashSet<>();
@@ -237,6 +237,12 @@ public class MainActivity extends Activity {
         downButton.setText("↓");
         downButton.setOnClickListener(v -> scrollToBottom());
         topButtons.addView(downButton, weightedButton());
+
+        Button friendButton = new Button(this);
+        friendButton.setFocusable(false);
+        friendButton.setText("FRIEND");
+        friendButton.setOnClickListener(v -> sendText("/friend"));
+        topButtons.addView(friendButton, weightedButton());
 
         Button anaButton = new Button(this);
         anaButton.setFocusable(false);
@@ -587,7 +593,7 @@ public class MainActivity extends Activity {
 
     private String roleForAuthor(String author) {
         if (author.equals("Вы")) return "user";
-        if (author.equals("ANA") || author.equals("ALIEN")) return "assistant";
+        if (author.equals("FRIEND") || author.equals("ANA") || author.equals("ALIEN")) return "assistant";
         return "system";
     }
 
@@ -599,7 +605,7 @@ public class MainActivity extends Activity {
 
     private void renderHistory() {
         StringBuilder builder = new StringBuilder();
-        if (events.isEmpty()) builder.append("Система:\nГотово. Команды: /ana, /alien, запомни: ..., /memory, /timers, /functions.\n\n");
+        if (events.isEmpty()) builder.append("Система:\nГотово. Режим FRIEND. Команды: /friend, /ana, /alien, запомни: ..., /memory, /timers, /functions.\n\n");
         for (JSONObject event : events) {
             String author = event.optString("author", authorForRole(event.optString("role", "system")));
             String text = event.optString("text", "");
