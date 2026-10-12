@@ -53,8 +53,8 @@ def _cookie_file():
 def _source_error(url: str, error: Exception) -> MediaError:
     message = str(error).lower()
     if "youtube.com" in url or "youtu.be" in url:
-        if "sign in to confirm" in message or "not a bot" in message:
-            return MediaError("YouTube запросил проверку на бота для этого сервера. Сейчас не удаётся скачать ролик.")
+        if "sign in to confirm" in message or "not a bot" in message or "failed to extract any player response" in message:
+            return MediaError("YouTube не отдал данные ролика серверу бота. Возможно, запросы с Render ограничены проверкой доступа.")
     return MediaError("Не удалось открыть видео. Оно может быть приватным или недоступным без входа.")
 
 
@@ -198,9 +198,9 @@ def download_video(url: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 1,
-        "extractor_retries": 1,
-        "socket_timeout": 20,
+        "retries": 0,
+        "extractor_retries": 0,
+        "socket_timeout": 12,
         "js_runtimes": {"deno": {"path": deno.find_deno_bin()}},
     }
     with _cookie_file() as cookie_file:

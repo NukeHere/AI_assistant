@@ -154,8 +154,12 @@ class TelegramMediaTests(unittest.TestCase):
         complete.assert_not_called()
 
     def test_youtube_bot_check_has_specific_error(self):
-        error = RuntimeError("Sign in to confirm you're not a bot")
-        self.assertIn("проверку на бота", str(telegram_media._source_error("https://youtube.com/shorts/abc", error)))
+        for raw_error in ("Sign in to confirm you're not a bot", "Failed to extract any player response"):
+            with self.subTest(raw_error=raw_error):
+                error = RuntimeError(raw_error)
+                message = str(telegram_media._source_error("https://youtube.com/shorts/abc", error))
+                self.assertIn("Render", message)
+                self.assertNotIn("приватным", message)
 
     def test_cookie_file_is_temporary(self):
         cookies = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n"
