@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import base64
 from pathlib import Path
 from unittest.mock import patch
 
@@ -72,7 +73,7 @@ class TelegramMediaTests(unittest.TestCase):
         self_outer = self
         attempted = []
 
-        def fake_download(_url, format_id, directory, _deadline):
+        def fake_download(_url, format_id, directory, _deadline, _cookie_file):
             attempted.append(format_id)
             if format_id == "720":
                 raise telegram_media.MediaTooLarge("oversized")
@@ -143,6 +144,70 @@ class TelegramMediaTests(unittest.TestCase):
             result = server.handle_telegram_update(update)
         self.assertEqual(result["handled"], "media_queued")
         self.assertEqual(queued.call_args.args[2], "https://www.instagram.com/reel/abc123/")
+
+    def test_unaddressed_message_from_another_bot_is_ignored(self):
+        update = telegram_update("Видео скачано")
+        update["message"]["from"] = {"id": 1234, "is_bot": True, "username": "OtherDownloader"}
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_BOT_TO_BOT", True), patch.object(server, "complete") as complete:
+            result = server.handle_telegram_update(update)
+        self.assertEqual(result["reason"], "unaddressed_bot_message")
+        complete.assert_not_called()
+
+    def test_youtube_bot_check_has_specific_error(self):
+        error = RuntimeError("Sign in to confirm you're not a bot")
+        self.assertIn("проверку на бота", str(telegram_media._source_error("https://youtube.com/shorts/abc", error)))
+
+    def test_cookie_file_is_temporary(self):
+        cookies = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tfoo\tbar\n"
+        with patch.dict("os.environ", {"YT_DLP_COOKIES_B64": base64.b64encode(cookies).decode()}):
+            with telegram_media._cookie_file() as path:
+                self.assertEqual(path.read_bytes(), cookies)
+            self.assertFalse(path.exists())
+
+    def test_status_message_is_deleted_after_video(self):
+        class OneItemQueue:
+            def __init__(self):
+                self.called = False
+                self.done = False
+
+            def get(self):
+                if self.called:
+                    raise StopIteration
+                self.called = True
+                return 555, 10, "https://youtu.be/abc", "test-chat"
+
+            def task_done(self):
+                self.done = True
+
+        queue = OneItemQueue()
+        with isolated_storage(), patch.object(server, "TELEGRAM_MEDIA_QUEUE", queue), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "download_and_send") as download, patch("app.telegram_moderation.api_call", side_effect=[{"message_id": 42}, True]) as api:
+            with self.assertRaises(StopIteration):
+                server.telegram_media_worker()
+        download.assert_called_once()
+        self.assertEqual(api.call_args_list[0].args[1], "sendMessage")
+        self.assertEqual(api.call_args_list[1].args[1], "deleteMessage")
+        self.assertEqual(api.call_args_list[1].args[2]["message_id"], 42)
+        self.assertTrue(queue.done)
+
+    def test_status_message_is_deleted_after_download_error(self):
+        class OneItemQueue:
+            def __init__(self):
+                self.called = False
+
+            def get(self):
+                if self.called:
+                    raise StopIteration
+                self.called = True
+                return 555, 10, "https://youtu.be/abc", "test-chat"
+
+            def task_done(self):
+                pass
+
+        with patch.object(server, "TELEGRAM_MEDIA_QUEUE", OneItemQueue()), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "download_and_send", side_effect=telegram_media.MediaError("ошибка")), patch.object(server, "try_send_telegram_message") as sent, patch("app.telegram_moderation.api_call", side_effect=[{"message_id": 42}, True]) as api:
+            with self.assertRaises(StopIteration):
+                server.telegram_media_worker()
+        sent.assert_called_once_with(555, "ошибка")
+        self.assertEqual(api.call_args_list[1].args[1], "deleteMessage")
 
 
 if __name__ == "__main__":

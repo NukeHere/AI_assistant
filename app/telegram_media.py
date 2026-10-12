@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import http.client
+import base64
 import json
+import os
 import re
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -25,6 +28,34 @@ class MediaError(Exception):
 
 class MediaTooLarge(MediaError):
     """A selected format exceeded the configured temporary-space budget."""
+
+
+@contextmanager
+def _cookie_file():
+    """Keep optional yt-dlp cookies out of the repository and remove them after use."""
+    encoded = os.getenv("YT_DLP_COOKIES_B64", "").strip()
+    if not encoded:
+        yield None
+        return
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise MediaError("Неверная настройка cookies для загрузчика видео.") from error
+    if not data.startswith((b"# Netscape HTTP Cookie File", b"# HTTP Cookie File")):
+        raise MediaError("Неверный формат cookies для загрузчика видео.")
+    with tempfile.TemporaryDirectory(prefix="assistant-cookies-") as directory:
+        path = Path(directory) / "cookies.txt"
+        path.write_bytes(data)
+        path.chmod(0o600)
+        yield path
+
+
+def _source_error(url: str, error: Exception) -> MediaError:
+    message = str(error).lower()
+    if "youtube.com" in url or "youtu.be" in url:
+        if "sign in to confirm" in message or "not a bot" in message:
+            return MediaError("YouTube запросил проверку на бота для этого сервера. Сейчас не удаётся скачать ролик.")
+    return MediaError("Не удалось открыть видео. Оно может быть приватным или недоступным без входа.")
 
 
 def find_video_url(text: str) -> str | None:
@@ -108,7 +139,7 @@ def format_candidates(info: dict[str, object], max_bytes: int = MAX_VIDEO_BYTES)
     return list(dict.fromkeys(choice[2] for choice in choices))
 
 
-def _download_one(url: str, format_id: str, directory: Path, deadline: float) -> Path:
+def _download_one(url: str, format_id: str, directory: Path, deadline: float, cookie_file: Path | None = None) -> Path:
     import deno
     import imageio_ffmpeg
     import yt_dlp
@@ -141,6 +172,11 @@ def _download_one(url: str, format_id: str, directory: Path, deadline: float) ->
         "socket_timeout": 20,
         "progress_hooks": [progress],
     }
+    if cookie_file is not None:
+        options["cookiefile"] = str(cookie_file)
+    proxy = os.getenv("YT_DLP_PROXY_URL", "").strip()
+    if proxy:
+        options["proxy"] = proxy
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.extract_info(url, download=True)
     video = directory / "video.mp4"
@@ -167,27 +203,33 @@ def download_video(url: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         "socket_timeout": 20,
         "js_runtimes": {"deno": {"path": deno.find_deno_bin()}},
     }
-    try:
-        with yt_dlp.YoutubeDL(metadata_options) as downloader:
-            info = downloader.extract_info(url, download=False)
-    except Exception as error:
-        raise MediaError("Не удалось открыть видео. Оно может быть приватным или недоступным без входа.") from error
-    if not isinstance(info, dict) or info.get("entries") is not None or info.get("is_live"):
-        raise MediaError("Поддерживаются только отдельные опубликованные видео, не эфиры и не плейлисты.")
-    candidates = format_candidates(info)
-    if not candidates:
-        raise MediaError("Нет подходящего формата MP4 размером до 45 МБ.")
-    last_error: Exception | None = None
-    for format_id in candidates[:6]:
-        if time.monotonic() > deadline:
-            break
-        temporary = tempfile.TemporaryDirectory(prefix="assistant-video-")
+    with _cookie_file() as cookie_file:
+        if cookie_file is not None:
+            metadata_options["cookiefile"] = str(cookie_file)
+        proxy = os.getenv("YT_DLP_PROXY_URL", "").strip()
+        if proxy:
+            metadata_options["proxy"] = proxy
         try:
-            video = _download_one(url, format_id, Path(temporary.name), deadline)
-            return temporary, video
+            with yt_dlp.YoutubeDL(metadata_options) as downloader:
+                info = downloader.extract_info(url, download=False)
         except Exception as error:
-            last_error = error
-            temporary.cleanup()
+            raise _source_error(url, error) from error
+        if not isinstance(info, dict) or info.get("entries") is not None or info.get("is_live"):
+            raise MediaError("Поддерживаются только отдельные опубликованные видео, не эфиры и не плейлисты.")
+        candidates = format_candidates(info)
+        if not candidates:
+            raise MediaError("Нет подходящего формата MP4 размером до 45 МБ.")
+        last_error: Exception | None = None
+        for format_id in candidates[:6]:
+            if time.monotonic() > deadline:
+                break
+            temporary = tempfile.TemporaryDirectory(prefix="assistant-video-")
+            try:
+                video = _download_one(url, format_id, Path(temporary.name), deadline, cookie_file)
+                return temporary, video
+            except Exception as error:
+                last_error = error
+                temporary.cleanup()
     raise MediaError("Не удалось скачать видео в пределах 45 МБ. Попробуй более короткий ролик.") from last_error
 
 

@@ -661,6 +661,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
 
     addressed = is_telegram_addressed(text)
     reply_to_bot = is_reply_to_telegram_bot(message)
+    if is_bot and not addressed and not reply_to_bot:
+        audit_event("telegram_ignored", reason="unaddressed_bot_message", chat_id=chat_id, telegram_user_id=telegram_user_id)
+        return {"ok": True, "ignored": True, "reason": "unaddressed_bot_message"}
     message_id = message.get("message_id")
     user = storage.upsert_telegram_user(
         telegram_user_id=telegram_user_id,
@@ -1406,7 +1409,18 @@ def queue_telegram_media(chat_id: object, message_id: object | None, url: str, c
 def telegram_media_worker() -> None:
     while True:
         chat_id, message_id, url, conversation_id = TELEGRAM_MEDIA_QUEUE.get()
+        status_message_id = None
         try:
+            try:
+                from app.telegram_moderation import api_call
+                status_payload: dict[str, object] = {"chat_id": chat_id, "text": "Скачиваю 🎬"}
+                if message_id is not None:
+                    status_payload["reply_parameters"] = {"message_id": message_id, "allow_sending_without_reply": True}
+                status_message = api_call(TG_BOT_API_KEY, "sendMessage", status_payload)
+                if isinstance(status_message, dict):
+                    status_message_id = status_message.get("message_id")
+            except Exception as error:
+                audit_event("telegram_media_status_failed", chat_id=chat_id, error_type=type(error).__name__)
             download_and_send(url, chat_id, message_id, TG_BOT_API_KEY)
             storage.add_message(conversation_id, "assistant", "[Видео отправлено в Telegram]")
             audit_event("telegram_media_sent", chat_id=chat_id, message_id=message_id)
@@ -1417,6 +1431,12 @@ def telegram_media_worker() -> None:
             try_send_telegram_message(chat_id, "Не удалось скачать или отправить видео.")
             audit_event("telegram_media_failed", chat_id=chat_id, message_id=message_id, error_type=type(error).__name__)
         finally:
+            if status_message_id is not None:
+                try:
+                    from app.telegram_moderation import api_call
+                    api_call(TG_BOT_API_KEY, "deleteMessage", {"chat_id": chat_id, "message_id": status_message_id})
+                except Exception as error:
+                    audit_event("telegram_media_status_delete_failed", chat_id=chat_id, error_type=type(error).__name__)
             TELEGRAM_MEDIA_QUEUE.task_done()
 
 
