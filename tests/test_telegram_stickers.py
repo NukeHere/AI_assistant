@@ -48,6 +48,23 @@ class TelegramStickerTests(unittest.TestCase):
             self.assertEqual(result["telegram_route"], "emoji")
             send.assert_called_once_with(555, "👍")
 
+    def test_explicit_request_sends_sticker_without_probability_gate(self):
+        with isolated_storage(), patch.object(server, "TG_STICKER_REPLY_CHANCE", 0.0), patch.object(server.random, "choice", side_effect=["😀", "sticker-file"]), patch.object(telegram_moderation, "api_call", return_value=True) as api, patch.object(server, "send_telegram_message") as send, patch.object(server, "complete") as complete:
+            server.storage.save_telegram_stickers(555, [{"file_id": "sticker-file", "file_unique_id": "u1", "emoji": "😀"}])
+            result = server.handle_telegram_update(telegram_update("отправь стикер"))
+            self.assertEqual(result["handled"], "sticker")
+            self.assertEqual(api.call_args.args[1], "sendSticker")
+            self.assertEqual(api.call_args.args[2]["sticker"], "sticker-file")
+            send.assert_not_called()
+            complete.assert_not_called()
+
+    def test_explicit_request_explains_when_chat_has_no_stickers(self):
+        with isolated_storage(), patch.object(server, "send_telegram_message") as send, patch.object(server, "complete") as complete:
+            result = server.handle_telegram_update(telegram_update("отправь стикер"))
+            self.assertEqual(result["handled"], "sticker_unavailable")
+            self.assertIn("Пришли стикер", send.call_args.args[1])
+            complete.assert_not_called()
+
     def test_group_sticker_is_learned_without_forcing_reply(self):
         update = telegram_update("", "group")
         update["message"].pop("text")
