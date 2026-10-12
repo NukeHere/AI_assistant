@@ -6,8 +6,10 @@ import os
 import random
 import re
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from threading import Event, Thread
+from queue import Full, Queue
+from threading import Event, Lock, Thread
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +35,7 @@ from app.smart_memory import (
     sanitize_timed_memory_items,
 )
 from app.storage import Storage
+from app.telegram_media import MediaError, download_and_send, find_video_url
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("ASSISTANT_PORT") or os.getenv("PORT") or "8000")
@@ -63,6 +66,11 @@ TIMED_MEMORY_POLL_SECONDS = max(0.0, float(os.getenv("TIMED_MEMORY_POLL_SECONDS"
 AUDIT_LOG_PATH = Path(os.getenv("ASSISTANT_AUDIT_LOG_PATH", "./data/assistant-audit.jsonl"))
 AUDIT_LOG_MAX_TEXT = int(os.getenv("ASSISTANT_AUDIT_LOG_MAX_TEXT", "1200"))
 TELEGRAM_GROUP_STATE: dict[str, dict[str, object]] = {}
+TELEGRAM_MEDIA_QUEUE: Queue[tuple[object, object | None, str, str]] = Queue(maxsize=3)
+TELEGRAM_MEDIA_SEEN: deque[tuple[str, str]] = deque(maxlen=200)
+TELEGRAM_MEDIA_SEEN_SET: set[tuple[str, str]] = set()
+TELEGRAM_MEDIA_LOCK = Lock()
+TELEGRAM_MEDIA_WORKER_STARTED = False
 
 storage = Storage(DATABASE_PATH)
 
@@ -629,7 +637,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         audit_event("telegram_ignored", reason="no_message")
         return {"ok": True, "ignored": True, "reason": "no_message"}
     sticker = message.get("sticker") if isinstance(message.get("sticker"), dict) else None
-    text = str(message.get("text") or "").strip()
+    text = str(message.get("text") or message.get("caption") or "").strip()
     if not text and sticker:
         text = f"[Стикер: {str(sticker.get('emoji') or 'без эмодзи')[:32]}]"
     if not text:
@@ -679,6 +687,23 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         reply_to_bot=reply_to_bot,
         text_preview=text,
     )
+
+    media_url = find_video_url(text) if body.get("message") is message and not is_bot else None
+    if media_url and (is_authorized or TG_GUEST_CHAT_MODE):
+        conversation_id = f"tg-group-{chat_id}" if chat_type in {"group", "supergroup"} else (
+            linked_client_id if is_authorized and user.get("app_client_id") else f"telegram-{telegram_user_id}"
+        )
+        storage.ensure_conversation(conversation_id, conversation_id)
+        storage.add_message(
+            conversation_id, "user",
+            f"[Telegram id={telegram_user_id} @{username}] {text}" if chat_type != "private" else text,
+            message_uid=f"telegram-media-{chat_id}-{message_id}",
+        )
+        if queue_telegram_media(chat_id, message_id, media_url, conversation_id):
+            audit_event("telegram_media_queued", chat_id=chat_id, message_id=message_id)
+            return {"ok": True, "handled": "media_queued"}
+        audit_event("telegram_media_queue_rejected", chat_id=chat_id, message_id=message_id)
+        return {"ok": True, "ignored": True, "reason": "media_queue_full_or_duplicate"}
 
     should_process, decision_reason, participation_mode = telegram_participation_decision(
         command_text,
@@ -1355,6 +1380,44 @@ def telegram_start_text(user: dict[str, object], client_id: str, is_authorized: 
         "Чтобы связать меня с desktop/Android, в приложении напиши /id, затем сюда отправь /link app_client_id.\n"
         f"Пока твой временный guest client_id: {client_id}."
     )
+
+
+def queue_telegram_media(chat_id: object, message_id: object | None, url: str, conversation_id: str) -> bool:
+    """Bound the number of pending downloads and deduplicate webhook retries."""
+    global TELEGRAM_MEDIA_WORKER_STARTED
+    key = (str(chat_id), str(message_id))
+    with TELEGRAM_MEDIA_LOCK:
+        if key in TELEGRAM_MEDIA_SEEN_SET:
+            return False
+        try:
+            TELEGRAM_MEDIA_QUEUE.put_nowait((chat_id, message_id, url, conversation_id))
+        except Full:
+            return False
+        if len(TELEGRAM_MEDIA_SEEN) == TELEGRAM_MEDIA_SEEN.maxlen:
+            TELEGRAM_MEDIA_SEEN_SET.discard(TELEGRAM_MEDIA_SEEN.popleft())
+        TELEGRAM_MEDIA_SEEN.append(key)
+        TELEGRAM_MEDIA_SEEN_SET.add(key)
+        if not TELEGRAM_MEDIA_WORKER_STARTED:
+            Thread(target=telegram_media_worker, name="telegram-media-worker", daemon=True).start()
+            TELEGRAM_MEDIA_WORKER_STARTED = True
+    return True
+
+
+def telegram_media_worker() -> None:
+    while True:
+        chat_id, message_id, url, conversation_id = TELEGRAM_MEDIA_QUEUE.get()
+        try:
+            download_and_send(url, chat_id, message_id, TG_BOT_API_KEY)
+            storage.add_message(conversation_id, "assistant", "[Видео отправлено в Telegram]")
+            audit_event("telegram_media_sent", chat_id=chat_id, message_id=message_id)
+        except MediaError as error:
+            try_send_telegram_message(chat_id, str(error))
+            audit_event("telegram_media_failed", chat_id=chat_id, message_id=message_id, reason=str(error))
+        except Exception as error:
+            try_send_telegram_message(chat_id, "Не удалось скачать или отправить видео.")
+            audit_event("telegram_media_failed", chat_id=chat_id, message_id=message_id, error_type=type(error).__name__)
+        finally:
+            TELEGRAM_MEDIA_QUEUE.task_done()
 
 
 def remember_telegram_sticker(chat_id: object, sticker: dict[str, object]) -> None:
