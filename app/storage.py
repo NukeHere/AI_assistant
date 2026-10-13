@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.embeddings import cosine_similarity, embed_text
+from app.libsql_adapter import LibsqlConnection
 from app.personas import Persona
 from app.smart_memory import score_text
 
@@ -21,6 +22,8 @@ class Storage:
         self.auth_token = auth_token.strip()
         if bool(self.remote_url) != bool(self.auth_token):
             raise ValueError("Turso requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN")
+        if self.remote_url and not self.remote_url.startswith(("turso://", "libsql://")):
+            raise ValueError("TURSO_DATABASE_URL must start with turso:// or libsql://")
         self._lock = threading.Lock()
 
     def init(self) -> None:
@@ -327,7 +330,10 @@ class Storage:
 
     @contextmanager
     def _connect(self) -> Iterator[Any]:
-        if self.remote_url:
+        if self.remote_url.startswith("libsql://"):
+            import libsql
+            conn = LibsqlConnection(libsql.connect(database=self.remote_url, auth_token=self.auth_token))
+        elif self.remote_url:
             import turso_serverless
             conn = turso_serverless.connect(self.remote_url, auth_token=self.auth_token)
             conn.row_factory = turso_serverless.Row

@@ -1822,7 +1822,8 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "timed_memory": True,
                 "timed_memory_poll_seconds": TIMED_MEMORY_POLL_SECONDS,
                 "telegram_webhook": bool(TG_BOT_API_KEY),
-                "storage_backend": "turso" if storage.remote_url else "sqlite",
+                "storage_backend": ("libsql" if storage.remote_url.startswith("libsql://") else "turso")
+                if storage.remote_url else "sqlite",
                 "server_time_utc": current_times()[0],
                 "server_timezone": ASSISTANT_TIMEZONE,
             }

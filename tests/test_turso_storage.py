@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import libsql
+
 from app.storage import Storage
 
 
@@ -13,6 +15,8 @@ class TursoStorageTests(unittest.TestCase):
             Storage(Path("unused.sqlite3"), remote_url="turso://example")
         with self.assertRaises(ValueError):
             Storage(Path("unused.sqlite3"), auth_token="secret")
+        with self.assertRaises(ValueError):
+            Storage(Path("unused.sqlite3"), remote_url="https://example", auth_token="secret")
 
     def test_remote_backend_keeps_stickers_and_silence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -33,6 +37,31 @@ class TursoStorageTests(unittest.TestCase):
                 storage.set_telegram_chat_silent(555, True, 7)
 
                 reopened = Storage(local_file, remote_url="turso://example", auth_token="test-token")
+                self.assertEqual(reopened.conversation_state("conversation")["message_count"], 0)
+                self.assertEqual(reopened.telegram_sticker_ids(555, "🙂"), ["file"])
+                self.assertTrue(reopened.telegram_chat_control(555)["silent"])
+                self.assertFalse(local_file.exists())
+
+    def test_libsql_backend_uses_real_driver_and_keeps_rows_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            remote_file = Path(directory) / "libsql.sqlite3"
+            local_file = Path(directory) / "unused" / "local.sqlite3"
+            original_connect = libsql.connect
+
+            def connect(*, database, auth_token):
+                self.assertEqual(database, "libsql://example")
+                self.assertEqual(auth_token, "test-token")
+                return original_connect(str(remote_file))
+
+            with patch("libsql.connect", side_effect=connect):
+                storage = Storage(local_file, remote_url="libsql://example", auth_token="test-token")
+                storage.init()
+                storage.ensure_conversation("client", "conversation")
+                storage.save_telegram_stickers(555, [{"file_id": "file", "file_unique_id": "unique",
+                                                       "emoji": "🙂", "set_name": "test"}])
+                storage.set_telegram_chat_silent(555, True, 7)
+
+                reopened = Storage(local_file, remote_url="libsql://example", auth_token="test-token")
                 self.assertEqual(reopened.conversation_state("conversation")["message_count"], 0)
                 self.assertEqual(reopened.telegram_sticker_ids(555, "🙂"), ["file"])
                 self.assertTrue(reopened.telegram_chat_control(555)["silent"])
