@@ -5,28 +5,27 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.embeddings import cosine_similarity, embed_text
 from app.personas import Persona
 from app.smart_memory import score_text
 
 
-class ClosingConnection(sqlite3.Connection):
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
-        result = super().__exit__(exc_type, exc_value, traceback)
-        self.close()
-        return bool(result)
-
-
 class Storage:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, remote_url: str = "", auth_token: str = ""):
         self.db_path = db_path
+        self.remote_url = remote_url.strip()
+        self.auth_token = auth_token.strip()
+        if bool(self.remote_url) != bool(self.auth_token):
+            raise ValueError("Turso requires both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN")
         self._lock = threading.Lock()
 
     def init(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.remote_url:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(
                 """
@@ -143,6 +142,18 @@ class Storage:
                     message_id text not null,
                     primary key (chat_id, message_id)
                 );
+                create table if not exists telegram_chat_controls (
+                    chat_id text primary key,
+                    silent integer not null default 0,
+                    admins_json text,
+                    admin_fetch_failed_at text,
+                    updated_at text not null default current_timestamp
+                );
+                create table if not exists telegram_control_commands (
+                    chat_id text not null,
+                    message_id text not null,
+                    primary key (chat_id, message_id)
+                );
                 create table if not exists schema_migrations (
                     name text primary key
                 );
@@ -169,6 +180,41 @@ class Storage:
                                       )
                                 )""")
                 conn.execute("insert into schema_migrations(name) values ('friend_default')")
+
+    def telegram_chat_control(self, chat_id: object) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("select * from telegram_chat_controls where chat_id = ?", (str(chat_id),)).fetchone()
+        if not row:
+            return {"silent": False, "admins": None, "admin_fetch_failed_at": None}
+        return {"silent": bool(row["silent"]),
+                "admins": json.loads(row["admins_json"]) if row["admins_json"] is not None else None,
+                "admin_fetch_failed_at": row["admin_fetch_failed_at"]}
+
+    def save_telegram_chat_administrators(self, chat_id: object, admins: list[dict[str, str]]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("""insert into telegram_chat_controls(chat_id, admins_json, admin_fetch_failed_at)
+                            values (?, ?, null)
+                            on conflict(chat_id) do update set admins_json=excluded.admins_json,
+                            admin_fetch_failed_at=null""", (str(chat_id), json.dumps(admins, ensure_ascii=False)))
+
+    def mark_telegram_admin_fetch_failed(self, chat_id: object) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("""insert into telegram_chat_controls(chat_id, admin_fetch_failed_at)
+                            values (?, current_timestamp)
+                            on conflict(chat_id) do update set admin_fetch_failed_at=current_timestamp""",
+                         (str(chat_id),))
+
+    def set_telegram_chat_silent(self, chat_id: object, silent: bool, message_id: object) -> bool:
+        with self._lock, self._connect() as conn:
+            inserted = conn.execute("insert or ignore into telegram_control_commands(chat_id, message_id) values (?, ?)",
+                                    (str(chat_id), str(message_id)))
+            if inserted.rowcount != 1:
+                return False
+            conn.execute("""insert into telegram_chat_controls(chat_id, silent, updated_at)
+                            values (?, ?, current_timestamp)
+                            on conflict(chat_id) do update set silent=excluded.silent,
+                            updated_at=current_timestamp""", (str(chat_id), int(silent)))
+            return True
 
     def claim_telegram_summary_request(self, chat_id: object, message_id: object) -> bool:
         with self._lock, self._connect() as conn:
@@ -274,15 +320,28 @@ class Storage:
                 )
             ]
 
-    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    def _ensure_column(self, conn: Any, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
         if column not in columns:
             conn.execute(f"alter table {table} add column {column} {definition}")
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=ClosingConnection)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[Any]:
+        if self.remote_url:
+            import turso_serverless
+            conn = turso_serverless.connect(self.remote_url, auth_token=self.auth_token)
+            conn.row_factory = turso_serverless.Row
+        else:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def ensure_conversation(self, client_id: str, conversation_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as conn:

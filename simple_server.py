@@ -38,6 +38,7 @@ from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
 from app.pot_provider import prepare_async as prepare_pot_provider_async
 from app.telegram_digest import MOSCOW, day_bounds, is_summary_request, message_content, summarize
+from app.telegram_admin_control import fetch_administrators, is_current_administrator, parse_control_command
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("ASSISTANT_PORT") or os.getenv("PORT") or "8000")
@@ -82,7 +83,8 @@ TELEGRAM_MEDIA_SEEN_SET: set[tuple[str, str]] = set()
 TELEGRAM_MEDIA_LOCK = Lock()
 TELEGRAM_MEDIA_WORKER_STARTED = False
 
-storage = Storage(DATABASE_PATH)
+storage = Storage(DATABASE_PATH, remote_url=os.getenv("TURSO_DATABASE_URL", ""),
+                  auth_token=os.getenv("TURSO_AUTH_TOKEN", ""))
 
 
 def text_preview(text: object, limit: int | None = None) -> str:
@@ -217,6 +219,8 @@ def process_due_daily_summaries_once(now: datetime | None = None) -> int:
     start, end = day_bounds(day)
     sent = 0
     for chat_id in storage.telegram_group_chats_between(start, end):
+        if storage.telegram_chat_control(chat_id)["silent"]:
+            continue
         if storage.telegram_daily_summary_sent(chat_id, day.isoformat()):
             continue
         summary = group_summary(chat_id, day)
@@ -229,6 +233,44 @@ def process_due_daily_summaries_once(now: datetime | None = None) -> int:
         else:
             audit_event("telegram_daily_summary_failed", chat_id=chat_id, day=day.isoformat())
     return sent
+
+
+def handle_telegram_admin_control(chat_id: object, user_id: str, message_id: object, control: str) -> dict[str, object]:
+    if message_id is None:
+        return {"ok": True, "ignored": True, "reason": "missing_message_id"}
+    state = storage.telegram_chat_control(chat_id)
+    if state["admins"] is None:
+        try:
+            admins = fetch_administrators(chat_id, TG_BOT_API_KEY)
+            storage.save_telegram_chat_administrators(chat_id, admins)
+            state["admins"] = admins
+            audit_event("telegram_admins_loaded", chat_id=chat_id, count=len(admins))
+        except Exception as error:
+            audit_event("telegram_admins_load_failed", chat_id=chat_id, error_type=type(error).__name__)
+    try:
+        is_admin = is_current_administrator(chat_id, user_id, TG_BOT_API_KEY)
+    except Exception as error:
+        audit_event("telegram_admin_check_failed", chat_id=chat_id, error_type=type(error).__name__)
+        return {"ok": True, "ignored": True, "reason": "admin_check_failed"}
+    if not is_admin:
+        audit_event("telegram_admin_control_denied", chat_id=chat_id, user_id=user_id, control=control)
+        if not state["silent"]:
+            try_send_telegram_message(chat_id, "Эту команду может дать только администратор чата.")
+        return {"ok": True, "ignored": True, "reason": "not_chat_admin"}
+    if state["silent"] and control == "admins":
+        return {"ok": True, "ignored": True, "reason": "admin_silence"}
+    if control == "admins":
+        admins = state["admins"] or []
+        listing = ", ".join("@" + item["username"] if item.get("username") else item.get("name") or item["id"]
+                            for item in admins)
+        send_telegram_message(chat_id, "Администраторы чата (сохранённый список): " + (listing or "список пуст."))
+        return {"ok": True, "handled": "admins"}
+    if not storage.set_telegram_chat_silent(chat_id, control == "quiet", message_id):
+        return {"ok": True, "ignored": True, "reason": "duplicate_admin_control"}
+    response = "Хорошо, молчу в этом чате до команды «бот, говори» или /speak." if control == "quiet" else "Я снова могу говорить в этом чате."
+    send_telegram_message(chat_id, response)
+    audit_event("telegram_admin_control", chat_id=chat_id, user_id=user_id, control=control)
+    return {"ok": True, "handled": "admin_control", "control": control}
 
 
 def daily_summary_scheduler_loop(stop_event: Event) -> None:
@@ -718,9 +760,16 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         audit_event("telegram_ignored", reason="bot_sender", chat_id=chat_id, telegram_user_id=telegram_user_id, username=username, text_preview=text)
         return {"ok": True, "ignored": True, "reason": "bot_sender"}
     message_id = message.get("message_id")
-    if chat_type in {"group", "supergroup"} and not is_bot and message_id is not None:
+    is_group = chat_type in {"group", "supergroup"}
+    addressed = is_telegram_addressed(text)
+    reply_to_bot = is_reply_to_telegram_bot(message)
+    telegram_command = parse_telegram_command(text)
+    control = parse_control_command(text, telegram_command, telegram_known_bot_usernames()) if is_group else None
+    if control and not telegram_command and not (addressed or reply_to_bot):
+        control = None
+    if is_group and not is_bot and message_id is not None:
         digest_text = message_content(message, text)
-        if digest_text and not is_summary_request(text, parse_telegram_command(text), telegram_known_bot_usernames()):
+        if digest_text and not control and not is_summary_request(text, telegram_command, telegram_known_bot_usernames()):
             display_name = " ".join(str(sender.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
             sent_timestamp = int(message.get("date") or datetime.now(timezone.utc).timestamp())
             sent_at = datetime.fromtimestamp(sent_timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -732,8 +781,11 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if sticker:
         remember_telegram_sticker(chat_id, sticker)
 
-    addressed = is_telegram_addressed(text)
-    reply_to_bot = is_reply_to_telegram_bot(message)
+    if is_group and control and not is_bot:
+        return handle_telegram_admin_control(chat_id, telegram_user_id, message_id, control)
+    if is_group and storage.telegram_chat_control(chat_id)["silent"]:
+        audit_event("telegram_ignored", reason="admin_silence", chat_id=chat_id, telegram_user_id=telegram_user_id)
+        return {"ok": True, "ignored": True, "reason": "admin_silence"}
     if is_bot and not addressed and not reply_to_bot:
         audit_event("telegram_ignored", reason="unaddressed_bot_message", chat_id=chat_id, telegram_user_id=telegram_user_id)
         return {"ok": True, "ignored": True, "reason": "unaddressed_bot_message"}
@@ -744,7 +796,6 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         last_name=str(sender.get("last_name") or ""),
         is_bot=is_bot,
     )
-    telegram_command = parse_telegram_command(text)
     is_own_command = is_telegram_command_for_this_bot(telegram_command, chat_type)
     command_name = str(telegram_command.get("command") or "") if is_own_command else ""
     command_args = str(telegram_command.get("args") or "") if is_own_command else ""
@@ -902,6 +953,12 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     user_text = command_text
     if not is_authorized:
         user_text = f"[Telegram guest @{user.get('username') or telegram_user_id}] {command_text}"
+    sender_is_chat_admin = False
+    if is_group and (addressed or reply_to_bot) and storage.telegram_chat_control(chat_id)["admins"] is not None:
+        try:
+            sender_is_chat_admin = is_current_administrator(chat_id, telegram_user_id, TG_BOT_API_KEY)
+        except Exception as error:
+            audit_event("telegram_admin_check_failed", chat_id=chat_id, error_type=type(error).__name__)
     try:
         payload = handle_message_request({
             "client_id": linked_client_id,
@@ -909,7 +966,9 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
             "text": user_text,
             "history_text": f"[Telegram id={telegram_user_id} @{username}] {user_text}" if chat_type != "private" else user_text,
             "channel": "telegram_group" if chat_type != "private" else "telegram",
-            "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode) + (
+            "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized,
+                                                        participation_mode=participation_mode,
+                                                        sender_is_chat_admin=sender_is_chat_admin) + (
                 "\nТекущее сообщение адресовано тебе напрямую (обращение, @упоминание или ответ на твоё сообщение). Ответь отправителю; если это только вызов по имени, кратко подтверди, что ты здесь. Не выбирай ignore только из-за отсутствия вопроса."
                 if chat_type in {"group", "supergroup"} and (addressed or reply_to_bot) else ""
             ),
@@ -1234,7 +1293,8 @@ def sanitize_telegram_action(action: object) -> dict[str, object] | None:
     }
 
 
-def telegram_channel_context(user: dict[str, object], chat: dict[str, object], chat_type: str, is_authorized: bool, participation_mode: str = "full") -> str:
+def telegram_channel_context(user: dict[str, object], chat: dict[str, object], chat_type: str, is_authorized: bool,
+                             participation_mode: str = "full", sender_is_chat_admin: bool = False) -> str:
     username = str(user.get("username") or "").strip()
     first_name = str(user.get("first_name") or "").strip()
     last_name = str(user.get("last_name") or "").strip()
@@ -1250,6 +1310,15 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     ]
     if chat_title:
         lines.append(f"Название чата: {chat_title}.")
+    if chat_type in {"group", "supergroup"}:
+        admin_state = storage.telegram_chat_control(chat.get("id"))
+        admins = admin_state["admins"] or []
+        if sender_is_chat_admin:
+            lines.append("Telegram подтвердил, что отправитель сейчас администратор этого чата. Учитывай его просьбы о правилах и своём участии в беседе; управляющие команды сервер исполняет отдельно.")
+        if admins:
+            lines.append("Снимок списка администраторов чата (состав мог измениться): " + ", ".join(
+                "@" + str(item["username"]) if item.get("username") else str(item.get("name") or item["id"])
+                for item in admins) + ".")
     sticker_emojis = storage.telegram_sticker_emojis(chat.get("id"))
     if sticker_emojis:
         lines.append("В этом чате доступны стикеры для эмодзи: " + " ".join(sticker_emojis) + ".")
@@ -1753,6 +1822,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
                 "timed_memory": True,
                 "timed_memory_poll_seconds": TIMED_MEMORY_POLL_SECONDS,
                 "telegram_webhook": bool(TG_BOT_API_KEY),
+                "storage_backend": "turso" if storage.remote_url else "sqlite",
                 "server_time_utc": current_times()[0],
                 "server_timezone": ASSISTANT_TIMEZONE,
             }
