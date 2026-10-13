@@ -7,6 +7,26 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class TelegramStickerTests(unittest.TestCase):
+    def test_sticker_only_directive_never_silently_disappears(self):
+        with isolated_storage(), patch.object(server.random, "random", return_value=0.99), patch.object(server, "TG_STICKER_REPLY_CHANCE", 0), patch.object(telegram_moderation, "api_call", return_value=True) as api:
+            server.storage.save_telegram_stickers(555, [{"file_id": "file", "file_unique_id": "unique", "emoji": "👍"}])
+            result = server.route_telegram_response(555, "777", {}, "supergroup", {"text": "", "telegram_action": {"sticker_emoji": "👍"}}, message_id=10)
+            self.assertEqual(result["telegram_route"], "sticker")
+            api.assert_called_once()
+
+    def test_plural_colloquial_sticker_request_bypasses_model(self):
+        with isolated_storage(), patch.object(telegram_moderation, "api_call", return_value=True), patch.object(server, "complete") as complete:
+            server.storage.save_telegram_stickers(555, [{"file_id": "file", "file_unique_id": "unique", "emoji": "👍"}])
+            result = server.handle_telegram_update(telegram_update("Кидай стикеры"))
+            self.assertEqual(result["handled"], "sticker")
+            complete.assert_not_called()
+
+    def test_model_timeout_is_acknowledged_with_visible_private_fallback(self):
+        with isolated_storage(), patch.object(server, "complete", side_effect=TimeoutError()), patch.object(server, "send_telegram_message") as send:
+            result = server.handle_telegram_update(telegram_update("Привет"))
+            self.assertEqual(result["handled"], "model_unavailable")
+            send.assert_called_once()
+
     def setUp(self):
         key = patch.object(server, "TG_BOT_API_KEY", "test")
         key.start()
@@ -65,15 +85,15 @@ class TelegramStickerTests(unittest.TestCase):
             self.assertIn("Пришли стикер", send.call_args.args[1])
             complete.assert_not_called()
 
-    def test_group_sticker_is_learned_without_forcing_reply(self):
+    def test_group_sticker_reaches_model_without_forcing_reply(self):
         update = telegram_update("", "group")
         update["message"].pop("text")
         update["message"]["sticker"] = {"file_id": "first", "file_unique_id": "u1", "emoji": "😀"}
-        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete") as complete:
+        with isolated_storage(), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", return_value=('{"telegram_action":{"reply_to":"ignore"}}', "mock")) as complete:
             result = server.handle_telegram_update(update)
-            self.assertTrue(result["ignored"])
+            self.assertEqual(result["telegram_route"], "ignore")
             self.assertEqual(server.storage.telegram_sticker_ids(555, "😀"), ["first"])
-            complete.assert_not_called()
+            complete.assert_called_once()
 
 
 if __name__ == "__main__":

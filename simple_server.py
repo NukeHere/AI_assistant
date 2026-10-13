@@ -810,6 +810,8 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     )
     if not should_process and chat_type == "supergroup" and not sticker:
         should_process, decision_reason, participation_mode = True, "moderation_review", "moderation"
+    if not should_process and sticker and is_authorized:
+        should_process, decision_reason, participation_mode = True, "sticker_context", "relevant"
     if not should_process:
         if chat_type in {"group", "supergroup"}:
             group_scope = f"tg-group-{chat_id}"
@@ -873,7 +875,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         conversation_id = f"telegram-{telegram_user_id}"
     if chat_type in {"group", "supergroup"}:
         linked_client_id = conversation_id = f"tg-group-{chat_id}"
-    if re.search(r"(?iu)(?<!\w)(?:отправь|пришли|скинь|пошли|покажи)(?!\w).{0,60}(?<!\w)стикер(?:а|ок|очек)?(?!\w)", command_text):
+    if re.search(r"(?iu)(?<!\w)(?:отправь|пришли|скинь|пошли|покажи|кидай|кинь)(?!\w).{0,60}(?<!\w)стикер(?:а|ы|ов|ок|очек)?(?!\w)", command_text):
         available_emojis = storage.telegram_sticker_emojis(chat_id)
         storage.ensure_conversation(linked_client_id, conversation_id)
         storage.add_message(conversation_id, "user", f"[Telegram id={telegram_user_id} @{username}] {command_text}" if chat_type != "private" else command_text)
@@ -900,17 +902,24 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     user_text = command_text
     if not is_authorized:
         user_text = f"[Telegram guest @{user.get('username') or telegram_user_id}] {command_text}"
-    payload = handle_message_request({
-        "client_id": linked_client_id,
-        "conversation_id": conversation_id,
-        "text": user_text,
-        "history_text": f"[Telegram id={telegram_user_id} @{username}] {user_text}" if chat_type != "private" else user_text,
-        "channel": "telegram_group" if chat_type != "private" else "telegram",
-        "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode) + (
-            "\nТекущее сообщение адресовано тебе напрямую (обращение, @упоминание или ответ на твоё сообщение). Ответь отправителю; если это только вызов по имени, кратко подтверди, что ты здесь. Не выбирай ignore только из-за отсутствия вопроса."
-            if chat_type in {"group", "supergroup"} and (addressed or reply_to_bot) else ""
-        ),
-    })
+    try:
+        payload = handle_message_request({
+            "client_id": linked_client_id,
+            "conversation_id": conversation_id,
+            "text": user_text,
+            "history_text": f"[Telegram id={telegram_user_id} @{username}] {user_text}" if chat_type != "private" else user_text,
+            "channel": "telegram_group" if chat_type != "private" else "telegram",
+            "channel_context": telegram_channel_context(user, chat, chat_type, is_authorized, participation_mode=participation_mode) + (
+                "\nТекущее сообщение адресовано тебе напрямую (обращение, @упоминание или ответ на твоё сообщение). Ответь отправителю; если это только вызов по имени, кратко подтверди, что ты здесь. Не выбирай ignore только из-за отсутствия вопроса."
+                if chat_type in {"group", "supergroup"} and (addressed or reply_to_bot) else ""
+            ),
+        })
+    except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as error:
+        audit_event("telegram_model_failed", chat_id=chat_id, error_type=type(error).__name__)
+        if chat_type == "private" or addressed or reply_to_bot:
+            try_send_telegram_message(chat_id, "Модель сейчас не ответила вовремя. Попробуй ещё раз чуть позже.")
+        # Acknowledge handled upstream failures instead of redelivering the same message.
+        return {"ok": True, "handled": "model_unavailable"}
     action = payload.get("telegram_action") or {}
     if isinstance(action, dict) and (action.get("mute") or action.get("unmute")):
         from app.telegram_moderation import execute_mute, execute_unmute
@@ -1244,7 +1253,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     sticker_emojis = storage.telegram_sticker_emojis(chat.get("id"))
     if sticker_emojis:
         lines.append("В этом чате доступны стикеры для эмодзи: " + " ".join(sticker_emojis) + ".")
-    lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji, например "👍". Сервер иногда отправит этот эмодзи или случайный стикер с ним из наборов этого чата. Сохрани обычный текстовый ответ как запасной вариант. Не используй для важных объяснений.')
+    lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji, например "👍". Сервер отправит подходящий стикер из наборов этого чата или эмодзи, если стикера нет. Используй стикеры самостоятельно, когда они подходят к короткой дружеской реплике; отдельная просьба не нужна. Сохрани обычный текстовый ответ как запасной вариант. Не используй для важных объяснений.')
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
@@ -1311,7 +1320,7 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
             and (chat_type == "private" or reply_to == "group")
             and not group_text_explicit and not private_text_explicit
             and not action.get("private_to_username") and not action.get("private_to_telegram_user_id")
-            and random.random() < TG_STICKER_REPLY_CHANCE):
+            ):
         sent, kind = send_telegram_expression(chat_id, expression_emoji, message_id)
         if sent:
             return {
@@ -1558,7 +1567,7 @@ def remember_telegram_sticker(chat_id: object, sticker: dict[str, object]) -> No
 
 def send_telegram_expression(chat_id: object, emoji: str, message_id: object | None = None) -> tuple[bool, str]:
     sticker_ids = storage.telegram_sticker_ids(chat_id, emoji)
-    if sticker_ids and random.random() < 0.75:
+    if sticker_ids:
         try:
             from app.telegram_moderation import api_call
             payload: dict[str, object] = {"chat_id": chat_id, "sticker": random.choice(sticker_ids)}
@@ -1674,7 +1683,7 @@ def complete_ollama(messages: list[dict[str, str]]) -> str:
         method="POST",
         headers=ollama_headers(),
     )
-    with urlopen(request, timeout=180) as response:
+    with urlopen(request, timeout=25) as response:
         data = json.loads(response.read().decode("utf-8"))
     return data["message"]["content"]
 
