@@ -27,6 +27,8 @@ class Storage:
             raise ValueError("TURSO_DATABASE_URL must start with turso:// or libsql://")
         self._lock = threading.Lock()
         self._compaction_lock = threading.Lock()
+        self.background_compaction = False
+        self._compacting_groups = set()
         self.group_history_limit = max(2, int(os.getenv("TG_GROUP_HISTORY_LIMIT", "50")))
         self.group_summary_limit = max(256, int(os.getenv("TG_GROUP_SUMMARY_CHARS", "6000")))
         self.group_history_summarizer = None
@@ -448,6 +450,24 @@ class Storage:
         return [dict(row) for row in rows]
 
     def compact_group_history(self, conversation_id: str) -> None:
+        if not conversation_id.startswith("tg-group-"):
+            return
+        if not self.background_compaction:
+            self._compact_group_history(conversation_id)
+            return
+        with self._lock:
+            if conversation_id in self._compacting_groups:
+                return
+            self._compacting_groups.add(conversation_id)
+        def worker():
+            try:
+                self._compact_group_history(conversation_id)
+            finally:
+                with self._lock:
+                    self._compacting_groups.discard(conversation_id)
+        threading.Thread(target=worker, name="group-history-compaction", daemon=True).start()
+
+    def _compact_group_history(self, conversation_id: str) -> None:
         if not conversation_id.startswith("tg-group-"):
             return
         from app.history_compaction import compact_text

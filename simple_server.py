@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import faulthandler
 import html
 import json
 import os
@@ -343,6 +344,7 @@ def summarize_expired_group_history(previous, lines, limit):
 
 
 storage.group_history_summarizer = summarize_expired_group_history
+storage.background_compaction = True
 
 
 def handle_history_request(body: dict[str, object]) -> dict[str, object]:
@@ -1976,6 +1978,8 @@ def ensure_telegram_reaction_subscription() -> None:
 
 
 def main() -> None:
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(60, repeat=True)
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     if telegram_video_enabled():
