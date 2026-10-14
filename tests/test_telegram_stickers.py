@@ -7,6 +7,13 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class TelegramStickerTests(unittest.TestCase):
+    def test_expanded_families_keep_the_same_intent(self):
+        pairs = (("🥳", "🎉"), ("🤔", "🧐"), ("😢", "🫂"), ("👎", "❌"), ("😴", "💤"))
+        for requested, available in pairs:
+            with self.subTest(requested=requested), isolated_storage(), patch.object(server, "TG_STICKER_VARIATION_CHANCE", 1), patch.object(server.random, "random", return_value=0):
+                server.storage.save_telegram_stickers(555, [{"file_id": available, "file_unique_id": available, "emoji": available}])
+                self.assertEqual(server.choose_telegram_sticker_emoji(555, requested), available)
+
     def test_thumbs_up_can_use_similar_sticker_from_chat(self):
         with isolated_storage(), patch.object(server, "TG_STICKER_VARIATION_CHANCE", 1), patch.object(server.random, "random", return_value=0), patch.object(server.random, "choice", side_effect=["💪", "strong"]), patch.object(telegram_moderation, "api_call", return_value=True) as api:
             server.storage.save_telegram_stickers(555, [{"file_id": "strong", "file_unique_id": "strong", "emoji": "💪"}])
