@@ -1991,7 +1991,6 @@ def ensure_telegram_reaction_subscription() -> None:
 
 def main() -> None:
     faulthandler.enable()
-    faulthandler.dump_traceback_later(60, repeat=True)
     storage.init()
     server = ThreadingHTTPServer((HOST, PORT), AssistantHandler)
     if telegram_video_enabled():
