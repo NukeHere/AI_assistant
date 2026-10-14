@@ -707,12 +707,18 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         return memory_response
 
     history_text = str(body.get("history_text") or text)
+    if channel == "telegram_group":
+        audit_event("telegram_prompt_building", conversation_id=conversation_id)
     messages = build_messages_for_model(client_id, conversation_id, history_text, active_persona, channel=channel, channel_context=channel_context)
+    if channel == "telegram_group":
+        audit_event("telegram_prompt_ready", conversation_id=conversation_id, message_count=len(messages), prompt_chars=sum(len(item["content"]) for item in messages))
 
     storage.add_message(conversation_id, "user", history_text)
     if active_persona == Persona.ALIEN:
         storage.update_alien_glossary(client_id, conversation_id, extract_alien_glossary_terms(text))
     answer, model_mode, saved, recalled, timed_saved, requested_persona, telegram_action = complete_with_smart_memory(client_id, conversation_id, messages)
+    if channel == "telegram_group":
+        audit_event("telegram_model_completed", conversation_id=conversation_id, model_mode=model_mode)
     if requested_persona in {"FRIEND", "ANA", "ALIEN"}:
         active_persona = Persona(requested_persona)
         storage.set_persona(client_id, conversation_id, active_persona)
@@ -754,14 +760,15 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     )
     return payload
 def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
-    # Acknowledge old queued deliveries without generating replies after a restart.
+    # A cold start can be triggered by the very message Telegram is delivering.
+    # Keep a short grace window for those messages while discarding stale backlog.
     event = body.get("message_reaction") or body.get("edited_message") or body.get("message")
     if isinstance(event, dict):
         try:
             sent_at = int(event.get("edit_date") or event.get("date") or 0)
         except (TypeError, ValueError):
             sent_at = 0
-        if sent_at and sent_at < TELEGRAM_STARTED_AT:
+        if sent_at and sent_at < TELEGRAM_STARTED_AT - 300:
             audit_event("telegram_ignored", reason="before_server_restart", update_id=body.get("update_id"))
             return {"ok": True, "ignored": True, "reason": "before_server_restart"}
     if not TG_BOT_API_KEY:
@@ -891,8 +898,6 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         reply_to_bot=reply_to_bot,
         is_own_command=is_own_command,
     )
-    if not should_process and chat_type == "supergroup" and not sticker:
-        should_process, decision_reason, participation_mode = True, "moderation_review", "moderation"
     if not should_process and sticker and is_authorized:
         should_process, decision_reason, participation_mode = True, "sticker_context", "relevant"
     if not should_process:
