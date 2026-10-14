@@ -19,7 +19,6 @@ from urllib.request import Request, urlopen
 
 from app.capabilities import CAPABILITIES_PROMPT, capabilities_answer
 
-TELEGRAM_STARTED_AT = int(datetime.now(timezone.utc).timestamp())
 from app.web_search import search as tavily_search, search_prompt
 from app.personas import (
     Persona,
@@ -775,17 +774,26 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     )
     return payload
 def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
-    # A cold start can be triggered by the very message Telegram is delivering.
-    # Keep a short grace window for those messages while discarding stale backlog.
+    # Render may sleep while Telegram queues updates. A direct request must survive
+    # that restart; only old passive group traffic is safe to skip.
     event = body.get("message_reaction") or body.get("edited_message") or body.get("message")
     if isinstance(event, dict):
         try:
             sent_at = int(event.get("edit_date") or event.get("date") or 0)
         except (TypeError, ValueError):
             sent_at = 0
-        if sent_at and sent_at < TELEGRAM_STARTED_AT - 300:
-            audit_event("telegram_ignored", reason="before_server_restart", update_id=body.get("update_id"))
-            return {"ok": True, "ignored": True, "reason": "before_server_restart"}
+        age = int(datetime.now(timezone.utc).timestamp()) - sent_at if sent_at else 0
+        if age > 86400:
+            audit_event("telegram_ignored", reason="expired_update", update_id=body.get("update_id"))
+            return {"ok": True, "ignored": True, "reason": "expired_update"}
+        chat = event.get("chat") if isinstance(event.get("chat"), dict) else {}
+        if age > 300 and chat.get("type") in {"group", "supergroup"}:
+            text = str(event.get("text") or event.get("caption") or "").strip()
+            direct = (is_telegram_addressed(text) or is_reply_to_telegram_bot(event)
+                      or bool(parse_telegram_command(text)))
+            if not direct:
+                audit_event("telegram_ignored", reason="old_passive_group_update", update_id=body.get("update_id"))
+                return {"ok": True, "ignored": True, "reason": "old_passive_group_update"}
     if not TG_BOT_API_KEY:
         audit_event("telegram_ignored", reason="telegram_disabled")
         return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
