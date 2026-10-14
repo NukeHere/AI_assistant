@@ -444,10 +444,10 @@ class Storage:
             row = conn.execute("select summary from group_history_context where conversation_id = ?", (conversation_id,)).fetchone()
         return str(row["summary"]) if row else ""
 
-    def pending_group_history(self, conversation_id: str) -> list[dict[str, Any]]:
+    def pending_group_history(self, conversation_id: str, limit: int = 25) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
-            rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id", (conversation_id,)).fetchall()
-        return [dict(row) for row in rows]
+            rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id desc limit ?", (conversation_id, limit)).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def compact_group_history(self, conversation_id: str) -> None:
         if not conversation_id.startswith("tg-group-"):
