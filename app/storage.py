@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -25,6 +26,11 @@ class Storage:
         if self.remote_url and not self.remote_url.startswith(("turso://", "libsql://")):
             raise ValueError("TURSO_DATABASE_URL must start with turso:// or libsql://")
         self._lock = threading.Lock()
+        self._compaction_lock = threading.Lock()
+        self.group_history_limit = max(2, int(os.getenv("TG_GROUP_HISTORY_LIMIT", "50")))
+        self.group_summary_limit = max(256, int(os.getenv("TG_GROUP_SUMMARY_CHARS", "6000")))
+        self.group_history_summarizer = None
+        self.group_compaction_batch = 25
 
     def init(self) -> None:
         if not self.remote_url:
@@ -48,6 +54,20 @@ class Storage:
                     content text not null,
                     created_at text not null default current_timestamp,
                     foreign key(conversation_id) references conversations(id)
+                );
+
+                create table if not exists group_history_pending (
+                    id integer primary key autoincrement,
+                    conversation_id text not null,
+                    role text not null,
+                    content text not null,
+                    created_at text not null
+                );
+                create table if not exists group_history_context (
+                    conversation_id text primary key,
+                    summary text not null,
+                    compacted_count integer not null default 0,
+                    updated_at text not null default current_timestamp
                 );
 
                 create table if not exists memories (
@@ -244,6 +264,10 @@ class Storage:
                    content=excluded.content""",
                 (str(chat_id), str(message_id), str(user_id), username[:128], display_name[:128], content[:4000], sent_at),
             )
+            count = conn.execute("select count(*) as n from telegram_group_messages where chat_id = ?", (str(chat_id),)).fetchone()["n"]
+            if count > self.group_history_limit:
+                expired = conn.execute("select message_id from telegram_group_messages where chat_id = ? order by sent_at, cast(message_id as integer) limit ?", (str(chat_id), count - self.group_history_limit)).fetchall()
+                conn.executemany("delete from telegram_group_messages where chat_id = ? and message_id = ?", [(str(chat_id), row["message_id"]) for row in expired])
 
     def telegram_group_messages_between(self, chat_id: object, start: str, end: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -410,7 +434,45 @@ class Storage:
                 (conversation_id,),
             )
             row = conn.execute("select * from messages where id = ?", (row_id,)).fetchone()
+        self.compact_group_history(conversation_id)
         return dict(row)
+
+    def group_history_context(self, conversation_id: str) -> str:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("select summary from group_history_context where conversation_id = ?", (conversation_id,)).fetchone()
+        return str(row["summary"]) if row else ""
+
+    def pending_group_history(self, conversation_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id", (conversation_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def compact_group_history(self, conversation_id: str) -> None:
+        if not conversation_id.startswith("tg-group-"):
+            return
+        from app.history_compaction import compact_text
+        with self._compaction_lock:
+            with self._lock, self._connect() as conn:
+                count = conn.execute("select count(*) as n from messages where conversation_id = ?", (conversation_id,)).fetchone()["n"]
+                if count > self.group_history_limit:
+                    expired = conn.execute("select id, role, content, created_at from messages where conversation_id = ? order by id limit ?", (conversation_id, count - self.group_history_limit)).fetchall()
+                    conn.executemany("insert into group_history_pending (conversation_id, role, content, created_at) values (?, ?, ?, ?)", [(conversation_id, row["role"], row["content"], row["created_at"]) for row in expired])
+                    conn.execute("delete from messages where conversation_id = ? and id <= ?", (conversation_id, expired[-1]["id"]))
+            while True:
+                with self._lock, self._connect() as conn:
+                    rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id limit ?", (conversation_id, self.group_compaction_batch)).fetchall()
+                    if len(rows) < self.group_compaction_batch:
+                        return
+                    old = conn.execute("select summary, compacted_count from group_history_context where conversation_id = ?", (conversation_id,)).fetchone()
+                previous = str(old["summary"]) if old else ""
+                summary = compact_text(previous, [dict(row) for row in rows], self.group_summary_limit, self.group_history_summarizer)
+                with self._lock, self._connect() as conn:
+                    conn.execute("""insert into group_history_context (conversation_id, summary, compacted_count)
+                        values (?, ?, ?) on conflict(conversation_id) do update set
+                        summary=excluded.summary, compacted_count=excluded.compacted_count, updated_at=current_timestamp""",
+                        (conversation_id, summary, (int(old["compacted_count"]) if old else 0) + len(rows)))
+                    conn.execute("delete from group_history_pending where conversation_id = ? and id <= ?", (conversation_id, rows[-1]["id"]))
+
     def upsert_message_event(self, client_id: str, event: dict[str, Any]) -> bool:
         conversation_id = str(event.get("conversation_id") or "default").strip()
         role = str(event.get("role") or "").strip()
@@ -746,6 +808,11 @@ class Storage:
                 ).fetchall()
             ]
             conversation_ids = [row["id"] for row in conversations]
+            for conversation in conversations:
+                if conversation["id"].startswith("tg-group-"):
+                    context = conn.execute("select summary, compacted_count from group_history_context where conversation_id = ?", (conversation["id"],)).fetchone()
+                    conversation["group_history_context"] = dict(context) if context else None
+                    conversation["group_history_pending"] = [dict(row) for row in conn.execute("select role, content, created_at from group_history_pending where conversation_id = ? order by id", (conversation["id"],)).fetchall()]
             messages: list[dict[str, Any]] = []
             if conversation_ids:
                 placeholders = ",".join("?" for _ in conversation_ids)
@@ -868,6 +935,16 @@ class Storage:
                     ),
                 )
                 counts["conversations"] += 1
+                context = item.get("group_history_context")
+                if conversation_id.startswith("tg-group-") and isinstance(context, dict):
+                    conn.execute("""insert into group_history_context (conversation_id, summary, compacted_count) values (?, ?, ?)
+                        on conflict(conversation_id) do update set summary=excluded.summary, compacted_count=excluded.compacted_count
+                        where excluded.compacted_count > group_history_context.compacted_count""", (conversation_id, str(context.get("summary") or "")[:self.group_summary_limit], max(0, int(context.get("compacted_count") or 0))))
+                pending = item.get("group_history_pending")
+                if conversation_id.startswith("tg-group-") and isinstance(pending, list):
+                    exists = conn.execute("select 1 from group_history_pending where conversation_id = ? limit 1", (conversation_id,)).fetchone()
+                    if not exists:
+                        conn.executemany("insert into group_history_pending (conversation_id, role, content, created_at) values (?, ?, ?, ?)", [(conversation_id, str(row.get("role") or "user"), str(row.get("content") or ""), str(row.get("created_at") or "")) for row in pending if isinstance(row, dict)])
 
             for item in messages:
                 if not isinstance(item, dict):
@@ -1072,6 +1149,9 @@ class Storage:
                 )
                 counts["telegram_users"] += 1
 
+        for conversation in conversations:
+            if isinstance(conversation, dict) and conversation.get("id"):
+                self.compact_group_history(str(conversation["id"]))
         return counts
 
     def sync_messages(

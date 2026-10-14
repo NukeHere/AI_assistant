@@ -104,3 +104,19 @@ Authorization: Bearer <APP_API_TOKEN>
 Use this to see incoming desktop, Android and Telegram messages, routing decisions, ignored group messages, memory save/recall counters and Telegram response route.
 
 Telegram authorization links are included in `/v1/snapshot` as `telegram_users`, so the PC backup agent can preserve `telegram_user_id ↔ app_client_id ↔ username` across Render redeploys.
+
+## Ограничение истории группы
+
+По умолчанию свежая история каждой группы содержит не больше 50 записей
+(сообщения участников и сохранённые ответы бота). Вытесненные записи сохраняются
+в отдельном буфере. Каждые 25 записей объединяются одним запросом модели с
+предыдущим сжатым контекстом. Контекст ограничен 6000 символами; пока буфер
+не заполнен, его записи также входят в запрос к модели. Группы изолированы,
+личная история не сокращается. Контекст и буфер сохраняются в базе и snapshot.
+При ошибке модели используется ограниченная текстовая выжимка.
+
+`TG_GROUP_HISTORY_LIMIT=50` задаёт размер свежей истории;
+`TG_GROUP_SUMMARY_CHARS=6000` — длину сжатого контекста. Размер пачки — 25.
+Архив исходных сообщений для дневных отчётов также ограничен 50 последними
+сообщениями на группу: подробный дневной отчёт охватывает доступный остаток,
+а не всю удалённую переписку.
