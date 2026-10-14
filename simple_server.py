@@ -62,6 +62,14 @@ TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET", "")
 TG_BOT_USERNAME = os.getenv("TG_BOT_USERNAME", "VBDsThirdSon_bot").lstrip("@")
 TG_BOT_ID = os.getenv("TG_BOT_ID", "").strip()
 TG_STICKER_REPLY_CHANCE = min(1.0, max(0.0, float(os.getenv("TG_STICKER_REPLY_CHANCE", "0.08"))))
+TG_STICKER_VARIATION_CHANCE = min(1.0, max(0.0, float(os.getenv("TG_STICKER_VARIATION_CHANCE", "0.35"))))
+STICKER_EMOJI_FAMILIES = (
+    ("👍", "💪", "👌", "🙌", "👏", "🤝", "❤️", "💖"),
+    ("❤️", "💖", "💕", "😘", "🥰", "❤️‍🔥", "🫶"),
+    ("😂", "🤣", "😆", "😹", "🤭"),
+    ("🤗", "🥰", "🫂", "😊", "🫶"),
+    ("🤡", "🙃", "😏", "🫠", "😇", "❤️‍🔥", "🤗"),
+)
 TG_GROUP_ACTIVE_SECONDS = int(os.getenv("TG_GROUP_ACTIVE_SECONDS", "1800"))
 TG_AUTHORIZED_SAMPLE_EVERY = max(0, int(os.getenv("TG_AUTHORIZED_SAMPLE_EVERY", "5")))
 TG_GUEST_CHAT_MODE = os.getenv("TG_GUEST_CHAT_MODE", "true").lower() not in {"0", "false", "no", "off"}
@@ -1362,7 +1370,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     sticker_emojis = random.sample(all_sticker_emojis, min(32, len(all_sticker_emojis)))
     if sticker_emojis:
         lines.append("Примеры доступных стикеров этого чата (выборка меняется): " + " | ".join(sticker_emojis) + ". Можно выбрать и составной эмодзи; передавай его точно как показано. Выбирай по смыслу беседы, не повторяй постоянно одни и те же реакции.")
-    lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji, например "👍". Сервер отправит подходящий стикер из наборов этого чата или эмодзи, если стикера нет. Используй стикеры самостоятельно, когда они подходят к короткой дружеской реплике; отдельная просьба не нужна. Сохрани обычный текстовый ответ как запасной вариант. Не используй для важных объяснений.')
+    lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji. Сервер отправит стикер из набора этого чата или эмодзи, если подходящего стикера нет. Пробуй близкие по смыслу варианты из доступных: вместо 👍 иногда 💪, 🙌 или ❤️; для тёплого ответа ❤️, 🥰, 🫶 или 😘. На лёгкую токсичность иногда уместна мягкая ирония: 🙃, 🤡, 😏, 🤗 или ❤️‍🔥. Не трави человека в ответ, не шути над серьёзной бедой и не заменяй эмодзи важное объяснение. Выбирай по контексту, а не случайно; обычный текст оставляй запасным ответом.')
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
@@ -1675,7 +1683,8 @@ def remember_telegram_sticker(chat_id: object, sticker: dict[str, object]) -> No
 
 
 def send_telegram_expression(chat_id: object, emoji: str, message_id: object | None = None) -> tuple[bool, str]:
-    sticker_ids = storage.telegram_sticker_ids(chat_id, emoji)
+    chosen_emoji = choose_telegram_sticker_emoji(chat_id, emoji)
+    sticker_ids = storage.telegram_sticker_ids(chat_id, chosen_emoji)
     if sticker_ids:
         try:
             from app.telegram_moderation import api_call
@@ -1692,6 +1701,19 @@ def send_telegram_expression(chat_id: object, emoji: str, message_id: object | N
     except Exception as error:
         audit_event("telegram_emoji_send_failed", chat_id=chat_id, error_type=type(error).__name__)
         return False, ""
+
+
+def choose_telegram_sticker_emoji(chat_id: object, emoji: str) -> str:
+    if random.random() >= TG_STICKER_VARIATION_CHANCE:
+        return emoji
+    family = next((item for item in STICKER_EMOJI_FAMILIES if item[0] == emoji), None)
+    if family is None:
+        family = next((item for item in STICKER_EMOJI_FAMILIES if emoji in item), None)
+    if family:
+        alternatives = [candidate for candidate in family if candidate != emoji and storage.telegram_sticker_ids(chat_id, candidate)]
+        if alternatives:
+            return random.choice(alternatives)
+    return emoji
 
 
 def send_telegram_message(chat_id: object, text: str, persona: str = "") -> None:

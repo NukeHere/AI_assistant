@@ -7,6 +7,19 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class TelegramStickerTests(unittest.TestCase):
+    def test_thumbs_up_can_use_similar_sticker_from_chat(self):
+        with isolated_storage(), patch.object(server, "TG_STICKER_VARIATION_CHANCE", 1), patch.object(server.random, "random", return_value=0), patch.object(server.random, "choice", side_effect=["💪", "strong"]), patch.object(telegram_moderation, "api_call", return_value=True) as api:
+            server.storage.save_telegram_stickers(555, [{"file_id": "strong", "file_unique_id": "strong", "emoji": "💪"}])
+            sent, kind = server.send_telegram_expression(555, "👍", 10)
+            self.assertTrue(sent)
+            self.assertEqual(kind, "sticker")
+            self.assertEqual(api.call_args.args[2]["sticker"], "strong")
+
+    def test_variation_does_not_invent_sticker_or_change_explicit_emoji(self):
+        with isolated_storage(), patch.object(server, "TG_STICKER_VARIATION_CHANCE", 1), patch.object(server.random, "random", return_value=0):
+            self.assertEqual(server.choose_telegram_sticker_emoji(555, "👍"), "👍")
+            self.assertEqual(server.choose_telegram_sticker_emoji(555, "❤️‍🔥"), "❤️‍🔥")
+
     def test_all_pack_emojis_are_eligible_including_combinations(self):
         stickers = [
             {"file_id": f"file-{i}", "file_unique_id": f"unique-{i}", "emoji": f"😀{i}"}
