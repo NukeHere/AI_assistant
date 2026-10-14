@@ -18,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.capabilities import CAPABILITIES_PROMPT, capabilities_answer
+
+TELEGRAM_STARTED_AT = int(datetime.now(timezone.utc).timestamp())
 from app.web_search import search as tavily_search, search_prompt
 from app.personas import (
     Persona,
@@ -752,6 +754,16 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     )
     return payload
 def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
+    # Acknowledge old queued deliveries without generating replies after a restart.
+    event = body.get("message_reaction") or body.get("edited_message") or body.get("message")
+    if isinstance(event, dict):
+        try:
+            sent_at = int(event.get("edit_date") or event.get("date") or 0)
+        except (TypeError, ValueError):
+            sent_at = 0
+        if sent_at and sent_at < TELEGRAM_STARTED_AT:
+            audit_event("telegram_ignored", reason="before_server_restart", update_id=body.get("update_id"))
+            return {"ok": True, "ignored": True, "reason": "before_server_restart"}
     if not TG_BOT_API_KEY:
         audit_event("telegram_ignored", reason="telegram_disabled")
         return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
