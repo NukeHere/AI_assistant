@@ -7,6 +7,19 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class TelegramStickerTests(unittest.TestCase):
+    def test_all_pack_emojis_are_eligible_including_combinations(self):
+        stickers = [
+            {"file_id": f"file-{i}", "file_unique_id": f"unique-{i}", "emoji": f"😀{i}"}
+            for i in range(40)
+        ]
+        stickers.append({"file_id": "combo", "file_unique_id": "combo", "emoji": "❤️‍🔥"})
+        with isolated_storage():
+            server.storage.save_telegram_stickers(555, stickers)
+            available = server.storage.telegram_sticker_emojis(555)
+            self.assertEqual(len(available), 41)
+            self.assertIn("❤️‍🔥", available)
+            self.assertEqual(server.storage.telegram_sticker_ids(555, "❤️‍🔥"), ["combo"])
+
     def test_sticker_only_directive_never_silently_disappears(self):
         with isolated_storage(), patch.object(server.random, "random", return_value=0.99), patch.object(server, "TG_STICKER_REPLY_CHANCE", 0), patch.object(telegram_moderation, "api_call", return_value=True) as api:
             server.storage.save_telegram_stickers(555, [{"file_id": "file", "file_unique_id": "unique", "emoji": "👍"}])

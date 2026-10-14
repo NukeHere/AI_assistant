@@ -568,7 +568,7 @@ class SimpleServerTests(unittest.TestCase):
         self.assertEqual(third["handled"], "message")
         self.assertEqual(third.get("participation_mode"), "sample")
 
-    def test_telegram_reaction_update_is_logged_and_remembered_for_authorized_user(self) -> None:
+    def test_telegram_reaction_update_is_chat_history_not_memory(self) -> None:
         old_key = simple_server.TG_BOT_API_KEY
         old_send = simple_server.send_telegram_message
 
@@ -580,7 +580,9 @@ class SimpleServerTests(unittest.TestCase):
         try:
             with isolated_storage():
                 simple_server.handle_telegram_update(telegram_update("/link primary-user"))
+                simple_server.storage.record_telegram_group_message(555, 42, 888, "other", "Other", "Привет, как дела сегодня?", "2026-10-14 10:00:00")
                 response = simple_server.handle_telegram_update({
+                    "update_id": 12345,
                     "message_reaction": {
                         "chat": {"id": 555, "type": "group"},
                         "message_id": 42,
@@ -590,13 +592,17 @@ class SimpleServerTests(unittest.TestCase):
                     }
                 })
                 memory = simple_server.storage.list_memories("tg-group-555", limit=10)
+                history = simple_server.storage.recent_messages("tg-group-555", 5)
+                reaction_event = simple_server.storage.telegram_group_message(555, "reaction-12345")
         finally:
             simple_server.TG_BOT_API_KEY = old_key
             simple_server.send_telegram_message = old_send
 
         self.assertEqual(response["handled"], "reaction")
-        self.assertTrue(response["remembered"])
-        self.assertTrue(any("Telegram-реакция" in item["summary"] for item in memory))
+        self.assertTrue(response["recorded"])
+        self.assertEqual(memory, [])
+        self.assertIn("Привет, как дела сегодня?", history[-1]["content"])
+        self.assertIn("👍", reaction_event["content"])
 
     def test_telegram_addressing_uses_word_boundaries(self) -> None:
         self.assertFalse(simple_server.is_telegram_addressed("просто работай дальше"))

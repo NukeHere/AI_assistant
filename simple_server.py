@@ -776,7 +776,7 @@ def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
     reaction_update = body.get("message_reaction")
     if isinstance(reaction_update, dict):
-        return handle_telegram_reaction_update(reaction_update)
+        return handle_telegram_reaction_update(reaction_update, body.get("update_id"))
     message = body.get("message") or body.get("edited_message")
     if not isinstance(message, dict):
         audit_event("telegram_ignored", reason="no_message")
@@ -1074,7 +1074,7 @@ def remember_group_event(telegram_user_id, chat, message_id, summary, kind):
                             full_content=note, topics=["telegram", "group_event", str(chat.get("id"))], importance=2)
 
 
-def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[str, object]:
+def handle_telegram_reaction_update(reaction_update: dict[str, object], update_id: object = None) -> dict[str, object]:
     chat = reaction_update.get("chat") if isinstance(reaction_update.get("chat"), dict) else {}
     user = reaction_update.get("user") if isinstance(reaction_update.get("user"), dict) else {}
     chat_id = chat.get("id")
@@ -1095,23 +1095,25 @@ def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[
     is_authorized = is_authorized or (TG_OPEN_ACCESS and bool(telegram_user_id))
     if chat.get("type") in {"group", "supergroup"}:
         linked_client_id = f"tg-group-{chat_id}"
-    remembered = False
+    recorded = False
     if telegram_user_id and is_authorized:
         previous = telegram_reaction_emojis(reaction_update.get("old_reaction"))
-        summary = f"Telegram-реакция {' '.join(emoji_list) or 'удалена'} на сообщение {message_id}"
-        full = f"Пользователь Telegram @{username or telegram_user_id} (id={telegram_user_id}) изменил реакции на сообщение {message_id} в чате {chat_id}: {' '.join(previous) or 'нет'} → {' '.join(emoji_list) or 'нет'}."
+        target = storage.telegram_group_message(chat_id, message_id) if chat.get("type") in {"group", "supergroup"} else None
+        quote = " ".join(str(target["content"]).split())[:50] if target else ""
+        subject = f'сообщение: «{quote}»' if quote else f"сообщение #{message_id} (текст недоступен)"
+        change = f"{' '.join(previous) or 'нет'} → {' '.join(emoji_list) or 'нет'}"
+        full = f"[Telegram id={telegram_user_id} @{username or telegram_user_id}] Изменил реакцию на {subject}: {change}."
         conversation_id = linked_client_id if chat.get("type") in {"group", "supergroup"} else (DEFAULT_CONVERSATION_ID if storage.telegram_client_context(telegram_user_id)[1] else f"telegram-{telegram_user_id}")
         storage.ensure_conversation(linked_client_id, conversation_id)
-        storage.add_message(conversation_id, "user", full)
-        storage.add_memory_cell(
-            client_id=linked_client_id,
-            kind="thematic",
-            summary=summary[:240],
-            full_content=full,
-            topics=["telegram", "reaction"],
-            importance=1,
-        )
-        remembered = True
+        message_uid = f"telegram-reaction-{chat_id}-{update_id}" if update_id is not None else None
+        storage.add_message(conversation_id, "user", full, message_uid=message_uid)
+        if chat.get("type") in {"group", "supergroup"} and update_id is not None:
+            sent_timestamp = int(reaction_update.get("date") or datetime.now(timezone.utc).timestamp())
+            sent_at = datetime.fromtimestamp(sent_timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            display_name = " ".join(str(user.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
+            storage.record_telegram_group_message(chat_id, f"reaction-{update_id}", telegram_user_id, username,
+                                                  display_name or username or telegram_user_id, full, sent_at)
+        recorded = True
     audit_event(
         "telegram_reaction_received",
         chat_id=chat_id,
@@ -1120,9 +1122,9 @@ def handle_telegram_reaction_update(reaction_update: dict[str, object]) -> dict[
         username=username,
         authorized=is_authorized,
         reactions=" ".join(emoji_list),
-        remembered=remembered,
+        recorded=recorded,
     )
-    return {"ok": True, "handled": "reaction", "authorized": is_authorized, "remembered": remembered}
+    return {"ok": True, "handled": "reaction", "authorized": is_authorized, "recorded": recorded}
 
 
 def telegram_reaction_emojis(reactions: object) -> list[str]:
@@ -1356,9 +1358,10 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
             lines.append("Снимок списка администраторов чата (состав мог измениться): " + ", ".join(
                 "@" + str(item["username"]) if item.get("username") else str(item.get("name") or item["id"])
                 for item in admins) + ".")
-    sticker_emojis = storage.telegram_sticker_emojis(chat.get("id"))
+    all_sticker_emojis = storage.telegram_sticker_emojis(chat.get("id"))
+    sticker_emojis = random.sample(all_sticker_emojis, min(32, len(all_sticker_emojis)))
     if sticker_emojis:
-        lines.append("В этом чате доступны стикеры для эмодзи: " + " ".join(sticker_emojis) + ".")
+        lines.append("Примеры доступных стикеров этого чата (выборка меняется): " + " | ".join(sticker_emojis) + ". Можно выбрать и составной эмодзи; передавай его точно как показано. Выбирай по смыслу беседы, не повторяй постоянно одни и те же реакции.")
     lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji, например "👍". Сервер отправит подходящий стикер из наборов этого чата или эмодзи, если стикера нет. Используй стикеры самостоятельно, когда они подходят к короткой дружеской реплике; отдельная просьба не нужна. Сохрани обычный текстовый ответ как запасной вариант. Не используй для важных объяснений.')
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")

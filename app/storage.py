@@ -282,6 +282,14 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def telegram_group_message(self, chat_id: object, message_id: object) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "select user_id, username, display_name, content, sent_at from telegram_group_messages where chat_id = ? and message_id = ?",
+                (str(chat_id), str(message_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
     def telegram_group_chats_between(self, start: str, end: str) -> list[str]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
@@ -334,7 +342,7 @@ class Storage:
             return [
                 str(row["emoji"])
                 for row in conn.execute(
-                    "select distinct emoji from telegram_stickers where chat_id = ? order by emoji limit 32",
+                    "select distinct emoji from telegram_stickers where chat_id = ? order by emoji",
                     (str(chat_id),),
                 )
             ]
