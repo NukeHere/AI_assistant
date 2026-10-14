@@ -56,6 +56,17 @@ class GroupHistoryTests(unittest.TestCase):
         self.assertIn('pending agreement', messages[1]['content'])
         self.assertEqual(len(messages), 53)
 
+    def test_pending_context_is_bounded_when_compaction_lags(self):
+        with self.store._connect() as conn:
+            conn.executemany(
+                "insert into group_history_pending (conversation_id, role, content, created_at) values (?, ?, ?, ?)",
+                [('tg-group-1', 'user', str(n), '2026-10-14 10:00:00') for n in range(100)],
+            )
+        pending = self.store.pending_group_history('tg-group-1')
+        self.assertEqual(len(pending), 25)
+        self.assertEqual(pending[0]['content'], '75')
+        self.assertEqual(pending[-1]['content'], '99')
+
     def test_snapshot_restores_summary_and_pending(self):
         self.add('tg-group-1', [str(n) for n in range(80)])
         snapshot = self.store.export_client_snapshot('tg-group-1')
