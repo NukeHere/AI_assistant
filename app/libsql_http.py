@@ -3,9 +3,35 @@ from __future__ import annotations
 
 import base64
 import json
+import io
+import threading
+import requests
 import sqlite3
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from app.libsql_adapter import LibsqlRow
+
+
+_transport = threading.local()
+
+
+def urlopen(request, *, timeout):
+    """Reuse TLS connections within each worker, without sharing sessions across threads."""
+    session = getattr(_transport, "session", None)
+    if session is None:
+        session = _transport.session = requests.Session()
+    try:
+        response = session.post(request.full_url, data=request.data,
+                                headers=dict(request.header_items()), timeout=timeout,
+                                allow_redirects=False)
+        with response:
+            response.raise_for_status()
+            if response.is_redirect:
+                raise RuntimeError("Unexpected database HTTP redirect")
+            return io.BytesIO(response.content)
+    except requests.RequestException as error:
+        session.close()
+        _transport.session = None
+        raise RuntimeError("Database HTTP transport failed: " + type(error).__name__) from error
 
 
 def encode(value):
@@ -93,9 +119,18 @@ class HttpConnection:
         return Cursor(self._pipeline(requests)[-1]["result"])
 
     def executemany(self, sql, parameters):
+        if self.closed:
+            raise RuntimeError("Database connection is closed")
         cursor = Cursor({})
-        for args in parameters:
-            cursor = self.execute(sql, args)
+        parameters = iter(parameters)
+        from itertools import islice
+        while batch := list(islice(parameters, 100)):
+            requests = []
+            if not self.in_transaction:
+                requests.append(self._statement("BEGIN"))
+                self.in_transaction = True
+            requests.extend(self._statement(sql, args) for args in batch)
+            cursor = Cursor(self._pipeline(requests)[-1]["result"])
         return cursor
 
     def executescript(self, script):
@@ -113,12 +148,14 @@ class HttpConnection:
 
     def commit(self):
         if self.in_transaction:
-            self._pipeline([self._statement("COMMIT")])
+            self._pipeline([self._statement("COMMIT"), {"type": "close"}])
+            self.baton = None
             self.in_transaction = False
 
     def rollback(self):
         if self.in_transaction and self.baton:
-            self._pipeline([self._statement("ROLLBACK")])
+            self._pipeline([self._statement("ROLLBACK"), {"type": "close"}])
+            self.baton = None
             self.in_transaction = False
 
     def close(self):

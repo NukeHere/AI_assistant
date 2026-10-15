@@ -5,6 +5,25 @@ import simple_server as server
 from tests.test_simple_server_stdlib import telegram_update, isolated_storage
 
 class RestartTests(unittest.TestCase):
+    def test_webhook_retries_do_not_repeat_processing(self):
+        update = {"update_id": 999999991}
+        server.TELEGRAM_UPDATES_DONE.clear()
+        with patch.object(server, "_handle_telegram_update", return_value={"ok": True}) as handle:
+            server.handle_telegram_update(update)
+            self.assertEqual(server.handle_telegram_update(update)["reason"], "duplicate_update")
+            handle.assert_called_once()
+        server.TELEGRAM_UPDATES_DONE.clear()
+
+    def test_failed_update_can_retry(self):
+        update = {"update_id": 999999992}
+        with patch.object(server, "_handle_telegram_update", side_effect=RuntimeError):
+            with self.assertRaises(RuntimeError):
+                server.handle_telegram_update(update)
+        with patch.object(server, "_handle_telegram_update", return_value={"ok": True}) as handle:
+            server.handle_telegram_update(update)
+            handle.assert_called_once()
+        server.TELEGRAM_UPDATES_DONE.clear()
+
     def test_old_passive_group_backlog_is_skipped(self):
         update = telegram_update("разговор между участниками", "supergroup")
         update["message"]["date"] = int(datetime.now(timezone.utc).timestamp()) - 600

@@ -7,6 +7,7 @@ import os
 import random
 import re
 import uuid
+from time import monotonic
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from queue import Full, Queue
@@ -627,7 +628,9 @@ def complete_with_smart_memory(
     conversation_id: str,
     messages: list[dict[str, str]],
 ) -> tuple[str, str, int, int, int, str | None, dict[str, object] | None]:
+    model_started = monotonic()
     raw_answer, model_mode = complete(messages)
+    audit_event("model_timing", conversation_id=conversation_id, seconds=round(monotonic() - model_started, 3))
     answer, directive = extract_memory_directive(raw_answer)
     saved = save_memory_items(client_id, directive.remember)
     timed_saved = save_timed_memory_items(client_id, conversation_id, directive.timers)
@@ -723,7 +726,9 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
     history_text = str(body.get("history_text") or text)
     if channel == "telegram_group":
         audit_event("telegram_prompt_building", conversation_id=conversation_id)
+    prompt_started = monotonic()
     messages = build_messages_for_model(client_id, conversation_id, history_text, active_persona, channel=channel, channel_context=channel_context)
+    audit_event("prompt_timing", conversation_id=conversation_id, seconds=round(monotonic() - prompt_started, 3))
     if channel == "telegram_group":
         audit_event("telegram_prompt_ready", conversation_id=conversation_id, message_count=len(messages), prompt_chars=sum(len(item["content"]) for item in messages))
 
@@ -773,7 +778,32 @@ def handle_message_request(body: dict[str, object]) -> dict[str, object]:
         response_preview=answer,
     )
     return payload
+TELEGRAM_UPDATE_LOCK = Lock()
+TELEGRAM_UPDATES_IN_FLIGHT: set[int] = set()
+TELEGRAM_UPDATES_DONE: dict[int, None] = {}
+
+
 def handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
+    update_id = body.get("update_id")
+    if not isinstance(update_id, int):
+        return _handle_telegram_update(body)
+    with TELEGRAM_UPDATE_LOCK:
+        if update_id in TELEGRAM_UPDATES_IN_FLIGHT or update_id in TELEGRAM_UPDATES_DONE:
+            return {"ok": True, "ignored": True, "reason": "duplicate_update"}
+        TELEGRAM_UPDATES_IN_FLIGHT.add(update_id)
+    try:
+        result = _handle_telegram_update(body)
+        with TELEGRAM_UPDATE_LOCK:
+            TELEGRAM_UPDATES_DONE[update_id] = None
+            if len(TELEGRAM_UPDATES_DONE) > 2048:
+                del TELEGRAM_UPDATES_DONE[next(iter(TELEGRAM_UPDATES_DONE))]
+        return result
+    finally:
+        with TELEGRAM_UPDATE_LOCK:
+            TELEGRAM_UPDATES_IN_FLIGHT.discard(update_id)
+
+
+def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     # Render may sleep while Telegram queues updates. A direct request must survive
     # that restart; only old passive group traffic is safe to skip.
     event = body.get("message_reaction") or body.get("edited_message") or body.get("message")

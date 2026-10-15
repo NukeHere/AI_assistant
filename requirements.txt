@@ -5,3 +5,4 @@ turso_serverless==0.1.0
 libsql==0.1.11
 bgutil-ytdlp-pot-provider==2.0.2
 
+requests>=2.32,<3

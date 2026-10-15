@@ -48,6 +48,30 @@ class HttpTests(unittest.TestCase):
         self.assertTrue(any(r['baton'] == 'session' for r in requests))
         db.close()
 
+    def test_bulk_insert_uses_bounded_pipelines(self):
+        conn = HttpConnection('libsql://example', 'secret')
+        with patch.object(conn, '_pipeline', return_value=[{'result': {}}]) as send:
+            conn.executemany('insert into t values (?)', [(n,) for n in range(250)])
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(len(send.call_args_list[0].args[0]), 101)
+            self.assertEqual(len(send.call_args_list[-1].args[0]), 50)
+
+    def test_http_session_reuses_connections_without_retrying_writes(self):
+        from app import libsql_http
+        from urllib.request import Request
+        from unittest.mock import MagicMock
+        libsql_http._transport.session = None
+        response = MagicMock()
+        response.is_redirect = False
+        response.content = b'{}'
+        with patch.object(libsql_http.requests, 'Session') as make:
+            make.return_value.post.return_value = response
+            for _ in range(2):
+                libsql_http.urlopen(Request('https://example/v2/pipeline', data=b'{}'), timeout=10)
+            make.assert_called_once()
+            self.assertEqual(make.return_value.post.call_count, 2)
+        libsql_http._transport.session = None
+
     def test_timeout_is_propagated_without_retry(self):
         conn = HttpConnection('libsql://example', 'secret')
         with patch('app.libsql_http.urlopen', side_effect=TimeoutError) as send:
