@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.embeddings import cosine_similarity, embed_text
-from app.libsql_adapter import LibsqlConnection
+from app.libsql_http import HttpConnection
 from app.personas import Persona
 from app.smart_memory import score_text
 
@@ -365,8 +365,7 @@ class Storage:
     @contextmanager
     def _connect(self) -> Iterator[Any]:
         if self.remote_url.startswith("libsql://"):
-            import libsql
-            conn = LibsqlConnection(libsql.connect(database=self.remote_url, auth_token=self.auth_token))
+            conn = HttpConnection(self.remote_url, self.auth_token)
         elif self.remote_url:
             import turso_serverless
             conn = turso_serverless.connect(self.remote_url, auth_token=self.auth_token)

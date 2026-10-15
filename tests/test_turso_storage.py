@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import libsql
+from app.libsql_adapter import LibsqlConnection
 
 from app.storage import Storage
 
@@ -42,18 +42,17 @@ class TursoStorageTests(unittest.TestCase):
                 self.assertTrue(reopened.telegram_chat_control(555)["silent"])
                 self.assertFalse(local_file.exists())
 
-    def test_libsql_backend_uses_real_driver_and_keeps_rows_readable(self):
+    def test_libsql_backend_uses_http_connection_and_keeps_rows_readable(self):
         with tempfile.TemporaryDirectory() as directory:
             remote_file = Path(directory) / "libsql.sqlite3"
             local_file = Path(directory) / "unused" / "local.sqlite3"
-            original_connect = libsql.connect
 
-            def connect(*, database, auth_token):
+            def connect(database, auth_token):
                 self.assertEqual(database, "libsql://example")
                 self.assertEqual(auth_token, "test-token")
-                return original_connect(str(remote_file))
+                return LibsqlConnection(sqlite3.connect(remote_file))
 
-            with patch("libsql.connect", side_effect=connect):
+            with patch("app.storage.HttpConnection", side_effect=connect):
                 storage = Storage(local_file, remote_url="libsql://example", auth_token="test-token")
                 storage.init()
                 storage.ensure_conversation("client", "conversation")

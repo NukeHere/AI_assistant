@@ -1920,6 +1920,7 @@ class AssistantHandler(BaseHTTPRequestHandler):
             except ValueError as error:
                 self.send_json({"error": str(error)}, status=400)
             except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
+                audit_event("telegram_request_failed", error_type=type(error).__name__, error_preview=str(error))
                 self.send_json({"error": f"Telegram request failed: {error}"}, status=502)
             return
 
