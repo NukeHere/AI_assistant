@@ -1416,6 +1416,7 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if sticker_emojis:
         lines.append("Примеры доступных стикеров этого чата (выборка меняется): " + " | ".join(sticker_emojis) + ". Можно выбрать и составной эмодзи; передавай его точно как показано. Выбирай по смыслу беседы, не повторяй постоянно одни и те же реакции.")
     lines.append('Если короткий ответ уместно заменить одним эмодзи, можешь указать assistant_memory telegram_action.sticker_emoji. Сервер отправит стикер из набора этого чата или эмодзи, если подходящего стикера нет. Пробуй близкие по смыслу варианты из доступных: вместо 👍 иногда 💪, 🙌 или ❤️; для тёплого ответа ❤️, 🥰, 🫶 или 😘. На лёгкую токсичность иногда уместна мягкая ирония: 🙃, 🤡, 😏, 🤗 или ❤️‍🔥. Не трави человека в ответ, не шути над серьёзной бедой и не заменяй эмодзи важное объяснение. Выбирай по контексту, а не случайно; обычный текст оставляй запасным ответом.')
+    lines.append('Если хочешь отправить короткий текст, а затем отдельный стикер, укажи telegram_action.group_text и telegram_action.sticker_emoji; в личке — private_text и sticker_emoji. Убери выбранный эмодзи из текста, чтобы не дублировать его. Делай так изредка и учитывай просьбы участников обходиться без стикеров.')
     if chat_type == "private":
         lines.append("Telegram-ответ обычно должен быть кратким: 1-3 коротких абзаца, если пользователь явно не просит подробности.")
     if chat_type != "private":
@@ -1457,6 +1458,7 @@ def telegram_action_audit_details(action: dict[str, object] | None) -> dict[str,
         "private_to_username": str(action.get("private_to_username") or ""),
         "private_to_telegram_user_id": str(action.get("private_to_telegram_user_id") or ""),
         "reaction_emoji": str(action.get("reaction_emoji") or ""),
+        "sticker_emoji": str(action.get("sticker_emoji") or ""),
         "group_text_explicit": bool(action.get("group_text_explicit")),
         "private_text_explicit": bool(action.get("private_text_explicit")),
     }
@@ -1515,11 +1517,17 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
             else:
                 send_telegram_message(chat_id, private_text_to_send)
                 sent_private = True
+        expression_sent = False
+        expression_kind = ""
+        if sent_private and expression_emoji and not explicit_private_target:
+            expression_sent, expression_kind = send_telegram_expression(chat_id, expression_emoji, message_id)
         return {
             "telegram_route": "reaction" if reaction_only else "private",
             "telegram_private_sent": sent_private,
             "telegram_reaction_sent": reaction_sent,
             "telegram_text_suppressed": reaction_only,
+            "telegram_expression_sent": expression_sent,
+            "telegram_expression_kind": expression_kind,
             "telegram_action_details": {
                 **telegram_action_audit_details(action),
                 "sent_private_text_preview": "" if reaction_only else text_preview(private_text_to_send),
@@ -1544,6 +1552,10 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
     if reply_to in {"group", "both"} and group_text:
         send_telegram_message(chat_id, group_text)
         sent_group = True
+    expression_sent = False
+    expression_kind = ""
+    if sent_group and expression_emoji and reply_to == "group":
+        expression_sent, expression_kind = send_telegram_expression(chat_id, expression_emoji, message_id)
     private_chat_id = ""
     unknown_recipient = ""
     fallback_text = ""
@@ -1566,6 +1578,8 @@ def route_telegram_response(chat_id: object, telegram_user_id: str, user: dict[s
         "telegram_private_sent": sent_private,
         "telegram_reaction_sent": reaction_sent,
         "telegram_text_suppressed": reaction_only,
+        "telegram_expression_sent": expression_sent,
+        "telegram_expression_kind": expression_kind,
         "telegram_action_details": {
             **telegram_action_audit_details(action),
             "sent_group_text_preview": text_preview(group_text),

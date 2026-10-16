@@ -101,6 +101,29 @@ class TelegramStickerTests(unittest.TestCase):
             self.assertEqual(result["telegram_route"], "emoji")
             send.assert_called_once_with(555, "👍")
 
+    def test_group_text_then_sticker_are_two_messages(self):
+        with isolated_storage(), patch.object(telegram_moderation, "api_call", return_value=True) as api, patch.object(server, "send_telegram_message") as send:
+            server.storage.save_telegram_stickers(555, [{"file_id": "heart-file", "file_unique_id": "heart", "emoji": "🫶"}])
+            result = server.route_telegram_response(555, "777", {}, "supergroup", {
+                "text": "Ок.",
+                "telegram_action": {"reply_to": "group", "group_text": "Ок.", "sticker_emoji": "🫶"},
+            }, message_id=10)
+            send.assert_called_once_with(555, "Ок.")
+            self.assertEqual(api.call_args.args[1], "sendSticker")
+            self.assertEqual(api.call_args.args[2]["sticker"], "heart-file")
+            self.assertTrue(result["telegram_group_sent"])
+            self.assertTrue(result["telegram_expression_sent"])
+
+    def test_private_text_then_emoji_fallback_are_two_messages(self):
+        with isolated_storage(), patch.object(server, "send_telegram_message") as send:
+            result = server.route_telegram_response(555, "777", {}, "private", {
+                "text": "Ок.",
+                "telegram_action": {"reply_to": "private", "private_text": "Ок.", "sticker_emoji": "🫶"},
+            }, message_id=10)
+            self.assertEqual([call.args for call in send.call_args_list], [(555, "Ок."), (555, "🫶")])
+            self.assertTrue(result["telegram_private_sent"])
+            self.assertEqual(result["telegram_expression_kind"], "emoji")
+
     def test_explicit_request_sends_sticker_without_probability_gate(self):
         with isolated_storage(), patch.object(server, "TG_STICKER_REPLY_CHANCE", 0.0), patch.object(server.random, "choice", side_effect=["😀", "sticker-file"]), patch.object(telegram_moderation, "api_call", return_value=True) as api, patch.object(server, "send_telegram_message") as send, patch.object(server, "complete") as complete:
             server.storage.save_telegram_stickers(555, [{"file_id": "sticker-file", "file_unique_id": "u1", "emoji": "😀"}])
