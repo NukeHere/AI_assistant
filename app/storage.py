@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +16,9 @@ from app.embeddings import cosine_similarity, embed_text
 from app.libsql_http import HttpConnection
 from app.personas import Persona
 from app.smart_memory import score_text
+
+
+_CACHE_MISS = object()
 
 
 class Storage:
@@ -33,8 +38,33 @@ class Storage:
         self.group_summary_limit = max(256, int(os.getenv("TG_GROUP_SUMMARY_CHARS", "6000")))
         self.group_history_summarizer = None
         self.group_compaction_batch = 25
+        self._cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
+        self._cache_ttl = 60.0
+        self._cache_limit = 128
+
+    def _cached(self, key: tuple[Any, ...]) -> Any:
+        entry = self._cache.get(key)
+        if entry is None:
+            return _CACHE_MISS
+        if entry[0] <= time.monotonic():
+            self._cache.pop(key, None)
+            return _CACHE_MISS
+        return copy.deepcopy(entry[1])
+
+    def _remember_cache(self, key: tuple[Any, ...], value: Any) -> None:
+        self._cache.pop(key, None)
+        self._cache[key] = (time.monotonic() + self._cache_ttl, copy.deepcopy(value))
+        if len(self._cache) > self._cache_limit:
+            self._cache.pop(next(iter(self._cache)))
+
+    def _invalidate_cache(self, category: str, identity: object) -> None:
+        for key in list(self._cache):
+            if key[0] == category and key[1] == str(identity):
+                self._cache.pop(key, None)
 
     def init(self) -> None:
+        with self._lock:
+            self._cache.clear()
         if not self.remote_url:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
@@ -207,13 +237,21 @@ class Storage:
                 conn.execute("insert into schema_migrations(name) values ('friend_default')")
 
     def telegram_chat_control(self, chat_id: object) -> dict[str, Any]:
-        with self._lock, self._connect() as conn:
-            row = conn.execute("select * from telegram_chat_controls where chat_id = ?", (str(chat_id),)).fetchone()
-        if not row:
-            return {"silent": False, "admins": None, "admin_fetch_failed_at": None}
-        return {"silent": bool(row["silent"]),
-                "admins": json.loads(row["admins_json"]) if row["admins_json"] is not None else None,
-                "admin_fetch_failed_at": row["admin_fetch_failed_at"]}
+        key = ("control", str(chat_id))
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                row = conn.execute("select * from telegram_chat_controls where chat_id = ?", (str(chat_id),)).fetchone()
+            if not row:
+                result = {"silent": False, "admins": None, "admin_fetch_failed_at": None}
+            else:
+                result = {"silent": bool(row["silent"]),
+                    "admins": json.loads(row["admins_json"]) if row["admins_json"] is not None else None,
+                    "admin_fetch_failed_at": row["admin_fetch_failed_at"]}
+            self._remember_cache(key, result)
+            return result
 
     def save_telegram_chat_administrators(self, chat_id: object, admins: list[dict[str, str]]) -> None:
         with self._lock, self._connect() as conn:
@@ -221,6 +259,7 @@ class Storage:
                             values (?, ?, null)
                             on conflict(chat_id) do update set admins_json=excluded.admins_json,
                             admin_fetch_failed_at=null""", (str(chat_id), json.dumps(admins, ensure_ascii=False)))
+            self._invalidate_cache("control", chat_id)
 
     def mark_telegram_admin_fetch_failed(self, chat_id: object) -> None:
         with self._lock, self._connect() as conn:
@@ -228,6 +267,7 @@ class Storage:
                             values (?, current_timestamp)
                             on conflict(chat_id) do update set admin_fetch_failed_at=current_timestamp""",
                          (str(chat_id),))
+            self._invalidate_cache("control", chat_id)
 
     def set_telegram_chat_silent(self, chat_id: object, silent: bool, message_id: object) -> bool:
         with self._lock, self._connect() as conn:
@@ -239,6 +279,7 @@ class Storage:
                             values (?, ?, current_timestamp)
                             on conflict(chat_id) do update set silent=excluded.silent,
                             updated_at=current_timestamp""", (str(chat_id), int(silent)))
+            self._invalidate_cache("control", chat_id)
             return True
 
     def claim_telegram_summary_request(self, chat_id: object, message_id: object) -> bool:
@@ -328,34 +369,50 @@ class Storage:
                    file_id=excluded.file_id, emoji=excluded.emoji, set_name=excluded.set_name""",
                 rows,
             )
+            self._invalidate_cache("stickers", chat_id)
         return len(rows)
 
     def telegram_sticker_set_known(self, chat_id: object, set_name: str) -> bool:
-        with self._lock, self._connect() as conn:
-            return conn.execute(
-                "select 1 from telegram_stickers where chat_id = ? and set_name = ? limit 1",
-                (str(chat_id), set_name),
-            ).fetchone() is not None
+        key = ("stickers", str(chat_id), "set", set_name)
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                result = conn.execute(
+                    "select 1 from telegram_stickers where chat_id = ? and set_name = ? limit 1",
+                    (str(chat_id), set_name),
+                ).fetchone() is not None
+            self._remember_cache(key, result)
+            return result
 
     def telegram_sticker_emojis(self, chat_id: object) -> list[str]:
-        with self._lock, self._connect() as conn:
-            return [
-                str(row["emoji"])
-                for row in conn.execute(
+        key = ("stickers", str(chat_id), "emojis")
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                result = [str(row["emoji"]) for row in conn.execute(
                     "select distinct emoji from telegram_stickers where chat_id = ? order by emoji",
                     (str(chat_id),),
-                )
-            ]
+                )]
+            self._remember_cache(key, result)
+            return result
 
     def telegram_sticker_ids(self, chat_id: object, emoji: str) -> list[str]:
-        with self._lock, self._connect() as conn:
-            return [
-                str(row["file_id"])
-                for row in conn.execute(
+        key = ("stickers", str(chat_id), "ids", emoji)
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                result = [str(row["file_id"]) for row in conn.execute(
                     "select file_id from telegram_stickers where chat_id = ? and emoji = ?",
                     (str(chat_id), emoji),
-                )
-            ]
+                )]
+            self._remember_cache(key, result)
+            return result
 
     def _ensure_column(self, conn: Any, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})")}
@@ -443,18 +500,33 @@ class Storage:
                 (conversation_id,),
             )
             row = conn.execute("select * from messages where id = ?", (row_id,)).fetchone()
+            self._invalidate_cache("recent", conversation_id)
         self.compact_group_history(conversation_id)
         return dict(row)
 
     def group_history_context(self, conversation_id: str) -> str:
-        with self._lock, self._connect() as conn:
-            row = conn.execute("select summary from group_history_context where conversation_id = ?", (conversation_id,)).fetchone()
-        return str(row["summary"]) if row else ""
+        key = ("summary", str(conversation_id))
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                row = conn.execute("select summary from group_history_context where conversation_id = ?", (conversation_id,)).fetchone()
+            result = str(row["summary"]) if row else ""
+            self._remember_cache(key, result)
+            return result
 
     def pending_group_history(self, conversation_id: str, limit: int = 25) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id desc limit ?", (conversation_id, limit)).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        key = ("pending", str(conversation_id), limit)
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id desc limit ?", (conversation_id, limit)).fetchall()
+            result = [dict(row) for row in reversed(rows)]
+            self._remember_cache(key, result)
+            return result
 
     def compact_group_history(self, conversation_id: str) -> None:
         if not conversation_id.startswith("tg-group-"):
@@ -485,6 +557,8 @@ class Storage:
                     expired = conn.execute("select id, role, content, created_at from messages where conversation_id = ? order by id limit ?", (conversation_id, count - self.group_history_limit)).fetchall()
                     conn.executemany("insert into group_history_pending (conversation_id, role, content, created_at) values (?, ?, ?, ?)", [(conversation_id, row["role"], row["content"], row["created_at"]) for row in expired])
                     conn.execute("delete from messages where conversation_id = ? and id <= ?", (conversation_id, expired[-1]["id"]))
+                    self._invalidate_cache("recent", conversation_id)
+                    self._invalidate_cache("pending", conversation_id)
             while True:
                 with self._lock, self._connect() as conn:
                     rows = conn.execute("select * from group_history_pending where conversation_id = ? order by id limit ?", (conversation_id, self.group_compaction_batch)).fetchall()
@@ -499,6 +573,8 @@ class Storage:
                         summary=excluded.summary, compacted_count=excluded.compacted_count, updated_at=current_timestamp""",
                         (conversation_id, summary, (int(old["compacted_count"]) if old else 0) + len(rows)))
                     conn.execute("delete from group_history_pending where conversation_id = ? and id <= ?", (conversation_id, rows[-1]["id"]))
+                    self._invalidate_cache("summary", conversation_id)
+                    self._invalidate_cache("pending", conversation_id)
 
     def upsert_message_event(self, client_id: str, event: dict[str, Any]) -> bool:
         conversation_id = str(event.get("conversation_id") or "default").strip()
@@ -537,22 +613,30 @@ class Storage:
                 "update conversations set updated_at = max(updated_at, coalesce(?, current_timestamp)) where id = ?",
                 (created_at, conversation_id),
             )
+            self._invalidate_cache("recent", conversation_id)
         return True
 
     def recent_messages(self, conversation_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                """
-                select message_uid as message_id, conversation_id, role, content,
-                       created_at, device_id, client_created_at, content_hash
-                  from messages
-                 where conversation_id = ?
-                 order by id desc
-                 limit ?
-                """,
-                (conversation_id, limit),
-            ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        key = ("recent", str(conversation_id), limit)
+        with self._lock:
+            cached = self._cached(key)
+            if cached is not _CACHE_MISS:
+                return cached
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    select message_uid as message_id, conversation_id, role, content,
+                           created_at, device_id, client_created_at, content_hash
+                      from messages
+                     where conversation_id = ?
+                     order by id desc
+                     limit ?
+                    """,
+                    (conversation_id, limit),
+                ).fetchall()
+            result = [dict(row) for row in reversed(rows)]
+            self._remember_cache(key, result)
+            return result
 
     def alien_glossary(self, conversation_id: str) -> dict[str, str]:
         conversation = self.ensure_conversation("unknown", conversation_id)
@@ -818,6 +902,7 @@ class Storage:
                 )
             if rows:
                 conn.execute("update conversations set updated_at = current_timestamp where id = ?", (conversation_id,))
+                self._invalidate_cache("recent", conversation_id)
         return rows
 
     def export_client_snapshot(self, client_id: str) -> dict[str, Any]:
@@ -1175,6 +1260,8 @@ class Storage:
                     ),
                 )
                 counts["telegram_users"] += 1
+
+            self._cache.clear()
 
         for conversation in conversations:
             if isinstance(conversation, dict) and conversation.get("id"):

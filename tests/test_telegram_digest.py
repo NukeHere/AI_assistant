@@ -15,7 +15,7 @@ class TelegramDigestTests(unittest.TestCase):
         return update
 
     def test_records_each_human_once_and_summarizes_only_active_people(self):
-        today = datetime.now(MOSCOW).replace(hour=12, minute=0, second=0, microsecond=0)
+        today = datetime.now(MOSCOW)
         prompts = []
         def complete(messages):
             prompts.append(messages)
@@ -68,7 +68,7 @@ class TelegramDigestTests(unittest.TestCase):
         noon = datetime.combine(day, datetime.min.time(), MOSCOW).replace(hour=12)
         due = noon.replace(hour=23, minute=1)
         with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "send_telegram_message"), patch.object(server, "try_send_telegram_message", return_value=True) as send, patch.object(server, "complete", return_value=("делился новостями", "mock")):
-            server.handle_telegram_update(self._message("Новости проекта", 777, 10, noon))
+            server.handle_telegram_update(self._message("Новости проекта", 777, 10, datetime.now(MOSCOW)))
             self.assertEqual(server.process_due_daily_summaries_once(noon), 0)
             self.assertEqual(server.process_due_daily_summaries_once(due), 1)
             self.assertEqual(server.process_due_daily_summaries_once(due + timedelta(minutes=1)), 0)
