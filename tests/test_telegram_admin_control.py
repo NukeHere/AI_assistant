@@ -88,15 +88,17 @@ class TelegramAdminControlTests(unittest.TestCase):
             send.assert_called_once_with(555, "Мут выдан.")
             self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
 
-    def test_scheduled_summary_waits_during_silence(self):
+    def test_scheduled_summary_is_sent_during_silence(self):
         due = datetime.now(MOSCOW).replace(hour=23, minute=1)
         start = due.replace(hour=12, minute=0)
         sent_at = start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "try_send_telegram_message") as send, patch.object(server, "complete", return_value=("Весёлый день.", "mock")):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "try_send_telegram_message", return_value=True) as send, patch.object(server, "complete", return_value=("Весёлый день.", "mock")):
             server.storage.record_telegram_group_message(555, 1, 777, "telegram_user", "Telegram", "Новости", sent_at)
             server.storage.set_telegram_chat_silent(555, True, 2)
+            self.assertEqual(server.process_due_daily_summaries_once(due), 1)
             self.assertEqual(server.process_due_daily_summaries_once(due), 0)
-            send.assert_not_called()
+            send.assert_called_once()
+            self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
 
 
 if __name__ == "__main__":

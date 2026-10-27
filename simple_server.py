@@ -237,8 +237,6 @@ def process_due_daily_summaries_once(now: datetime | None = None) -> int:
     start, end = day_bounds(day)
     sent = 0
     for chat_id in storage.telegram_group_chats_between(start, end):
-        if storage.telegram_chat_control(chat_id)["silent"]:
-            continue
         if storage.telegram_daily_summary_sent(chat_id, day.isoformat()):
             continue
         summary = group_summary(chat_id, day)
@@ -285,7 +283,7 @@ def handle_telegram_admin_control(chat_id: object, user_id: str, message_id: obj
         return {"ok": True, "handled": "admins"}
     if not storage.set_telegram_chat_silent(chat_id, control == "quiet", message_id):
         return {"ok": True, "ignored": True, "reason": "duplicate_admin_control"}
-    response = "Хорошо, молчу в этом чате до команды «бот, говори» или /speak." if control == "quiet" else "Я снова могу говорить в этом чате."
+    response = "Хорошо, на обычные сообщения не отвечаю. По тегу или ответу мне можно обратиться; ежедневную сводку продолжу отправлять." if control == "quiet" else "Я снова могу говорить в этом чате."
     send_telegram_message(chat_id, response)
     audit_event("telegram_admin_control", chat_id=chat_id, user_id=user_id, control=control)
     return {"ok": True, "handled": "admin_control", "control": control}
