@@ -49,6 +49,45 @@ class TelegramAdminControlTests(unittest.TestCase):
             self.assertFalse(server.storage.telegram_chat_control(555)["silent"])
             send.assert_called_once()
 
+    def test_explicit_mention_wakes_quiet_bot_without_resuming_group(self):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "complete", return_value=("Я тут.", "mock")) as complete, patch.object(server, "send_telegram_message") as send:
+            server.storage.set_telegram_chat_silent(555, True, 1)
+            self.assertEqual(server.handle_telegram_update(telegram_update("бот, ответь", "group", message_id=30))["reason"], "admin_silence")
+            self.assertEqual(server.handle_telegram_update(telegram_update("/summary", "group", message_id=31))["reason"], "admin_silence")
+            self.assertEqual(server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot привет", "group", message_id=32))["handled"], "message")
+            self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
+            self.assertEqual(server.handle_telegram_update(telegram_update("обычное сообщение", "group", message_id=33))["reason"], "admin_silence")
+            complete.assert_called_once()
+            send.assert_called_once_with(555, "Я тут.")
+
+    def test_explicit_mention_can_request_summary_while_quiet(self):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "group_summary", return_value="Сводка за день.") as summary, patch.object(server, "send_telegram_message") as send:
+            server.storage.set_telegram_chat_silent(555, True, 1)
+            result = server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot сделай сводку", "group", message_id=34))
+            self.assertEqual(result["handled"], "daily_summary")
+            summary.assert_called_once()
+            send.assert_called_once_with(555, "Сводка за день.")
+            self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
+
+    def test_reply_to_bot_wakes_quiet_bot(self):
+        update = telegram_update("привет", "group", message_id=36)
+        update["message"]["reply_to_message"] = {"from": {"id": 123, "is_bot": True, "username": "VBDsThirdSon_bot"}}
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "complete", return_value=("Привет!", "mock")), patch.object(server, "send_telegram_message") as send:
+            server.storage.set_telegram_chat_silent(555, True, 1)
+            self.assertEqual(server.handle_telegram_update(update)["handled"], "message")
+            send.assert_called_once_with(555, "Привет!")
+            self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
+
+    def test_explicit_mention_can_reach_moderation_while_quiet(self):
+        directive = '{"telegram_action":{"mute":{"user_id":"888","minutes":1,"reason":"флуд"}}}'
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "complete", return_value=(directive, "mock")), patch("app.telegram_moderation.execute_mute", return_value={"success": True, "text": "Мут выдан.", "target_user_id": "888"}) as mute, patch.object(server, "send_telegram_message") as send:
+            server.storage.set_telegram_chat_silent(555, True, 1)
+            result = server.handle_telegram_update(telegram_update("@VBDsThirdSon_bot замути флудера", "group", message_id=35))
+            self.assertEqual(result["handled"], "moderation")
+            mute.assert_called_once()
+            send.assert_called_once_with(555, "Мут выдан.")
+            self.assertTrue(server.storage.telegram_chat_control(555)["silent"])
+
     def test_scheduled_summary_waits_during_silence(self):
         due = datetime.now(MOSCOW).replace(hour=23, minute=1)
         start = due.replace(hour=12, minute=0)

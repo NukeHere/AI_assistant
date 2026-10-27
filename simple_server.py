@@ -874,7 +874,7 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
 
     if is_group and control and not is_bot:
         return handle_telegram_admin_control(chat_id, telegram_user_id, message_id, control)
-    if is_group and storage.telegram_chat_control(chat_id)["silent"]:
+    if is_group and storage.telegram_chat_control(chat_id)["silent"] and not (is_telegram_direct_mention(text) or reply_to_bot):
         audit_event("telegram_ignored", reason="admin_silence", chat_id=chat_id, telegram_user_id=telegram_user_id)
         return {"ok": True, "ignored": True, "reason": "admin_silence"}
     if is_bot and not addressed and not reply_to_bot:
@@ -1337,10 +1337,8 @@ def is_telegram_relevant_for_assistant(text: str) -> bool:
 
 def is_telegram_addressed(text: str) -> bool:
     lowered = text.lower()
-    usernames = [name.lower() for name in [TG_BOT_USERNAME, "VBDsThirdSon_bot"] if name]
-    for username in usernames:
-        if re.search(rf"(?<![\w@])@{re.escape(username)}(?!\w)", lowered, flags=re.IGNORECASE):
-            return True
+    if is_telegram_direct_mention(text):
+        return True
     patterns = [
         r"(?<!\w)бот(?:ик)?(?!\w)",
         r"(?<!\w)секретарь(?!\w)",
@@ -1352,6 +1350,15 @@ def is_telegram_addressed(text: str) -> bool:
         r"(?<!\w)bot(?!\w)",
     ]
     return any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def is_telegram_direct_mention(text: str) -> bool:
+    lowered = text.lower()
+    usernames = [name.lower() for name in [TG_BOT_USERNAME, "VBDsThirdSon_bot"] if name]
+    for username in usernames:
+        if re.search(rf"(?<![\w@])@{re.escape(username)}(?!\w)", lowered, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def is_telegram_mention(text: str) -> bool:
@@ -1404,6 +1411,8 @@ def telegram_channel_context(user: dict[str, object], chat: dict[str, object], c
     if chat_type in {"group", "supergroup"}:
         admin_state = storage.telegram_chat_control(chat.get("id"))
         admins = admin_state["admins"] or []
+        if admin_state["silent"]:
+            lines.append("В этой группе активен режим тишины. Ты отвечаешь на текущее сообщение, потому что тебя вызвали напрямую. Выполни доступное действие и сохрани режим тишины для остальных сообщений.")
         if sender_is_chat_admin:
             lines.append("Telegram подтвердил, что отправитель сейчас администратор этого чата. Учитывай его просьбы о правилах и своём участии в беседе; управляющие команды сервер исполняет отдельно.")
         if admins:
