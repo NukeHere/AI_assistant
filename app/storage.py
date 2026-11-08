@@ -186,6 +186,15 @@ class Storage:
                 );
                 create index if not exists idx_telegram_group_messages_day
                     on telegram_group_messages (sent_at, chat_id);
+                create table if not exists telegram_group_members (
+                    chat_id text not null, user_id text not null,
+                    username text not null default '', display_name text not null default '',
+                    active integer not null default 1,
+                    primary key (chat_id, user_id)
+                );
+                insert or ignore into telegram_group_members (chat_id, user_id, username, display_name)
+                    select chat_id, user_id, username, display_name from telegram_group_messages
+                    order by sent_at desc, cast(message_id as integer) desc;
                 create table if not exists telegram_daily_summaries (
                     chat_id text not null,
                     day text not null,
@@ -294,6 +303,24 @@ class Storage:
         with self._lock, self._connect() as conn:
             conn.execute("delete from telegram_summary_requests where chat_id = ? and message_id = ?",
                          (str(chat_id), str(message_id)))
+
+    def record_telegram_group_member(self, chat_id, user, active=True):
+        user_id = str(user.get("id") or "")
+        if not user_id.isdecimal() or user.get("is_bot"):
+            return
+        name = " ".join(str(user.get(k) or "") for k in ("first_name", "last_name")).strip()
+        with self._lock, self._connect() as conn:
+            conn.execute("""insert into telegram_group_members
+                (chat_id, user_id, username, display_name, active) values (?, ?, ?, ?, ?)
+                on conflict(chat_id, user_id) do update set username=excluded.username,
+                display_name=excluded.display_name, active=excluded.active""",
+                (str(chat_id), user_id, str(user.get("username") or "")[:128], name[:128], int(active)))
+
+    def telegram_group_members(self, chat_id):
+        with self._lock, self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "select * from telegram_group_members where chat_id = ? and active = 1 order by user_id",
+                (str(chat_id),)).fetchall()]
 
     def record_telegram_group_message(self, chat_id: object, message_id: object, user_id: object,
                                       username: str, display_name: str, content: str, sent_at: str) -> None:

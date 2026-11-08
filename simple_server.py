@@ -41,6 +41,7 @@ from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
 from app.pot_provider import prepare_async as prepare_pot_provider_async
 from app.telegram_digest import MOSCOW, day_bounds, is_summary_request, message_content, summarize
+from app.telegram_all import is_all_mention, send_all_mentions, track_group_members
 from app.telegram_admin_control import fetch_administrators, is_current_administrator, parse_control_command
 
 HOST = os.getenv("ASSISTANT_HOST") or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
@@ -817,13 +818,16 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         if age > 300 and chat.get("type") in {"group", "supergroup"}:
             text = str(event.get("text") or event.get("caption") or "").strip()
             direct = (is_telegram_addressed(text) or is_reply_to_telegram_bot(event)
-                      or bool(parse_telegram_command(text)))
+                      or bool(parse_telegram_command(text)) or is_all_mention(text))
             if not direct:
                 audit_event("telegram_ignored", reason="old_passive_group_update", update_id=body.get("update_id"))
                 return {"ok": True, "ignored": True, "reason": "old_passive_group_update"}
     if not TG_BOT_API_KEY:
         audit_event("telegram_ignored", reason="telegram_disabled")
         return {"ok": True, "ignored": True, "reason": "telegram_disabled"}
+    track_group_members(storage, body)
+    if isinstance(body.get("chat_member"), dict):
+        return {"ok": True, "handled": "chat_member"}
     reaction_update = body.get("message_reaction")
     if isinstance(reaction_update, dict):
         return handle_telegram_reaction_update(reaction_update, body.get("update_id"))
@@ -870,6 +874,9 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if sticker:
         remember_telegram_sticker(chat_id, sticker)
 
+    if is_group and not is_bot and is_all_mention(text):
+        send_all_mentions(storage, chat_id, TG_BOT_API_KEY, message.get("message_thread_id"))
+        return {"ok": True, "handled": "all_mentions"}
     if is_group and control and not is_bot:
         return handle_telegram_admin_control(chat_id, telegram_user_id, message_id, control)
     if is_group and storage.telegram_chat_control(chat_id)["silent"] and not (is_telegram_direct_mention(text) or reply_to_bot):
@@ -2071,10 +2078,10 @@ def ensure_telegram_reaction_subscription() -> None:
             audit_event("telegram_reaction_subscription_skipped", reason="different_or_missing_webhook")
             return
         allowed = info.get("allowed_updates") or ["message", "edited_message", "channel_post", "edited_channel_post", "inline_query", "chosen_inline_result", "callback_query", "shipping_query", "pre_checkout_query", "poll", "poll_answer", "my_chat_member", "chat_join_request"]
-        if "message_reaction" not in allowed:
+        if "message_reaction" not in allowed or "chat_member" not in allowed:
             updated = api_call(TG_BOT_API_KEY, "setWebhook", {
                 "url": expected, "secret_token": TG_WEBHOOK_SECRET,
-                "allowed_updates": list(dict.fromkeys([*allowed, "message_reaction"])),
+                "allowed_updates": list(dict.fromkeys([*allowed, "message_reaction", "chat_member"])),
                 "drop_pending_updates": False,
                 "max_connections": info.get("max_connections", 40),
             })

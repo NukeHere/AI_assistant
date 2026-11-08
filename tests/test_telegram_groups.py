@@ -40,7 +40,7 @@ class GroupTests(unittest.TestCase):
         with patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_WEBHOOK_SECRET", "test-secret"), patch.dict("os.environ", {"TG_WEBHOOK_URL": info["url"]}), patch.object(moderation, "api_call", side_effect=[info, True]) as api:
             server.ensure_telegram_reaction_subscription()
             payload = api.call_args.args[2]
-            self.assertEqual(payload["allowed_updates"], ["message", "callback_query", "message_reaction"])
+            self.assertEqual(payload["allowed_updates"], ["message", "callback_query", "message_reaction", "chat_member"])
             self.assertFalse(payload["drop_pending_updates"])
             self.assertEqual(payload["max_connections"], 10)
 
