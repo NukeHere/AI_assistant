@@ -2,9 +2,16 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+
+class GroqRequestError(RuntimeError):
+    def __init__(self, code, reason):
+        super().__init__(f"Groq HTTP {code}: {reason}")
+        self.code = code
 
 
 def models():
@@ -52,13 +59,32 @@ def complete_groq(storage, messages):
     def request_model(key):
         api_messages = [{"role": message["role"], "content": message["content"]}
                         for message in messages]
-        payload = {"model": models()[key]["id"], "messages": api_messages, "temperature": 0.7}
+        payload = {"model": models()[key]["id"], "messages": api_messages,
+                   "temperature": 0.7, "max_completion_tokens": 1024}
         request = Request("https://api.groq.com/openai/v1/chat/completions",
                           data=json.dumps(payload).encode(),
                           headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                    "User-Agent": "AI-assistant/1.0", "Accept": "application/json"})
-        with urlopen(request, timeout=45) as response:
-            content = json.load(response)["choices"][0]["message"]["content"]
+        for attempt in range(2):
+            try:
+                with urlopen(request, timeout=45) as response:
+                    content = json.load(response)["choices"][0]["message"]["content"]
+                break
+            except HTTPError as error:
+                if error.code != 429 or attempt:
+                    raise
+                raw = error.read(4096)
+                match = re.search(rb"try again in ([0-9.]+)s", raw)
+                try:
+                    delay = float(error.headers.get("retry-after", ""))
+                except (TypeError, ValueError):
+                    delay = float(match.group(1)) if match else 0
+                if not 0 < delay <= 30:
+                    from io import BytesIO
+                    error.fp = BytesIO(raw)
+                    raise
+                error.close()
+                time.sleep(delay + 0.5)
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("Groq returned an empty response")
         return content
@@ -75,4 +101,4 @@ def complete_groq(storage, messages):
         except (ValueError, AttributeError):
             reason = "Cloudflare blocked the API client" if "1010" in raw or "cloudflare" in raw.lower() else "Non-JSON provider response"
         reason = re.sub(r"gsk_[\w-]+", "[redacted]", str(reason).replace(token, "[redacted]"))[:400]
-        raise RuntimeError(f"Groq HTTP {error.code}: {reason}") from error
+        raise GroqRequestError(error.code, reason) from error
