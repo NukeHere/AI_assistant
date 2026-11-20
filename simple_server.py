@@ -1085,7 +1085,8 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
         })
     except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as error:
         audit_event("telegram_model_failed", chat_id=chat_id, error_type=type(error).__name__,
-                    http_status=getattr(error, "code", None))
+                    http_status=getattr(error, "code", None),
+                    provider_detail=str(error)[:500] if MODEL_PROVIDER == "groq" and str(error).startswith("Groq HTTP ") else "")
         if chat_type == "private" or addressed or reply_to_bot:
             try_send_telegram_message(chat_id, model_failure_message(error))
         # Acknowledge handled upstream failures instead of redelivering the same message.
