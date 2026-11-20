@@ -41,7 +41,7 @@ from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
 from app.pot_provider import prepare_async as prepare_pot_provider_async
 from app.telegram_digest import MOSCOW, day_bounds, is_summary_request, message_content, summarize
-from app.model_selection import control_model, complete_groq
+from app.model_selection import control_model, complete_groq, COMPACT_CAPABILITIES, COMPACT_MEMORY
 from app.telegram_all import is_all_mention, send_all_mentions, track_group_members
 from app.telegram_admin_control import fetch_administrators, is_current_administrator, parse_control_command
 
@@ -563,7 +563,7 @@ def build_messages_for_model(
 ) -> list[dict[str, str]]:
     alien_glossary = storage.alien_glossary(conversation_id)
     system_prompt = build_system_prompt(persona, alien_glossary)
-    system_prompt += "\n\n" + CAPABILITIES_PROMPT
+    system_prompt += "\n\n" + (COMPACT_CAPABILITIES if MODEL_PROVIDER == "groq" else CAPABILITIES_PROMPT)
     system_prompt += "\n\n" + search_prompt()
     if channel == "telegram_group":
         compacted = storage.group_history_context(conversation_id)
@@ -574,7 +574,7 @@ def build_messages_for_model(
         system_prompt += "\n\nПравила личного Telegram-чата: отвечай на русском, если пользователь не попросил иначе; обычные ответы держи короткими, обычно 1-4 предложения. Избегай секций **Наблюдение:**, **Диагностика:** и других структурных меток, если пользователь не просит анализ, план или диагностику. Не выводи сырой Markdown, который Telegram плохо отображает."
     if channel_context:
         system_prompt += "\n\nКонтекст текущего канала:\n" + channel_context
-    system_prompt += "\n\n" + MEMORY_DIRECTIVE_PROMPT
+    system_prompt += "\n\n" + (COMPACT_MEMORY if MODEL_PROVIDER == "groq" else MEMORY_DIRECTIVE_PROMPT)
     now_utc, now_local = current_times()
     due_timers = materialize_due(client_id, conversation_id)
     system_prompt += "\n\n" + build_timed_memory_context(due_timers, now_utc, now_local)
