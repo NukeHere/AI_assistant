@@ -41,6 +41,7 @@ from app.storage import Storage
 from app.telegram_media import MediaError, download_and_send, find_video_url
 from app.pot_provider import prepare_async as prepare_pot_provider_async
 from app.telegram_digest import MOSCOW, day_bounds, is_summary_request, message_content, summarize
+from app.model_selection import control_model, complete_groq
 from app.telegram_all import is_all_mention, send_all_mentions, track_group_members
 from app.telegram_admin_control import fetch_administrators, is_current_administrator, parse_control_command
 
@@ -341,6 +342,8 @@ def handle_client_register_request(body: dict[str, object]) -> dict[str, object]
     }
 
 def complete(messages: list[dict[str, str]]) -> tuple[str, str]:
+    if MODEL_PROVIDER == "groq":
+        return complete_groq(storage, messages), "groq"
     if MODEL_PROVIDER == "ollama":
         return complete_ollama(messages), "ollama"
     if MODEL_PROVIDER == "openai" or MODEL_API_KEY:
@@ -874,8 +877,21 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
     if sticker:
         remember_telegram_sticker(chat_id, sticker)
 
+    if chat_type == "private" and not is_bot:
+        model_reply = control_model(storage, telegram_user_id, text)
+        if model_reply:
+            send_telegram_message(chat_id, model_reply)
+            return {"ok": True, "handled": "model_control"}
     if is_group and not is_bot and is_all_mention(text):
-        send_all_mentions(storage, chat_id, TG_BOT_API_KEY, message.get("message_thread_id"))
+        audit_event("telegram_all_requested", chat_id=chat_id, message_id=message_id)
+        try:
+            count = send_all_mentions(storage, chat_id, TG_BOT_API_KEY, message.get("message_thread_id"))
+        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as error:
+            audit_event("telegram_all_failed", chat_id=chat_id, error_type=type(error).__name__,
+                        http_status=getattr(error, "code", None))
+            try_send_telegram_message(chat_id, "Не удалось отправить все упоминания @all. Проверь права бота и попробуй позже. Эта команда не использует модель.")
+            return {"ok": True, "handled": "all_mentions_failed"}
+        audit_event("telegram_all_sent", chat_id=chat_id, mention_count=count)
         return {"ok": True, "handled": "all_mentions"}
     if is_group and control and not is_bot:
         return handle_telegram_admin_control(chat_id, telegram_user_id, message_id, control)
@@ -1068,9 +1084,10 @@ def _handle_telegram_update(body: dict[str, object]) -> dict[str, object]:
             ),
         })
     except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as error:
-        audit_event("telegram_model_failed", chat_id=chat_id, error_type=type(error).__name__)
+        audit_event("telegram_model_failed", chat_id=chat_id, error_type=type(error).__name__,
+                    http_status=getattr(error, "code", None))
         if chat_type == "private" or addressed or reply_to_bot:
-            try_send_telegram_message(chat_id, "Модель сейчас не ответила вовремя. Попробуй ещё раз чуть позже.")
+            try_send_telegram_message(chat_id, model_failure_message(error))
         # Acknowledge handled upstream failures instead of redelivering the same message.
         return {"ok": True, "handled": "model_unavailable"}
     action = payload.get("telegram_action") or {}
@@ -1871,6 +1888,17 @@ def complete_openai_compatible(messages: list[dict[str, str]]) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+def model_failure_message(error: Exception) -> str:
+    code = getattr(error, "code", None)
+    if code == 402:
+        return "Сервис модели отклонил запрос: требуется оплата или восстановление доступного лимита (HTTP 402). Владельцу бота нужно проверить аккаунт провайдера. Команда @all в группе работает независимо от модели."
+    if code in {401, 403}:
+        return "Сервис модели отказал в доступе. Владельцу бота нужно проверить ключ и права доступа к модели."
+    if code == 429:
+        return "Сервис модели ограничил частоту запросов или исчерпан лимит использования. Попробуй позже."
+    return "Сервис модели сейчас недоступен. Попробуй ещё раз позже."
+
+
 def complete_ollama(messages: list[dict[str, str]]) -> str:
     payload = json.dumps(
         {
@@ -1899,6 +1927,8 @@ def ollama_headers() -> dict[str, str]:
 
 
 def provider_mode() -> str:
+    if MODEL_PROVIDER == "groq":
+        return "groq"
     if MODEL_PROVIDER == "ollama":
         return "ollama"
     if MODEL_PROVIDER == "openai" or MODEL_API_KEY:
@@ -2104,6 +2134,7 @@ def main() -> None:
     print(f"AI Assistant simple server: http://{HOST}:{PORT}", flush=True)
     print("Endpoints: POST /v1/message, POST /v1/history, POST /v1/snapshot, POST /v1/sync, POST /v1/client/register, POST /v1/telegram/webhook, POST /v1/chat/simple", flush=True)
     print("Model mode:", provider_mode(), flush=True)
+    print("Model name:", MODEL_NAME, flush=True)
     try:
         server.serve_forever()
     finally:

@@ -1,4 +1,5 @@
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import simple_server as server
@@ -7,6 +8,27 @@ from tests.test_simple_server_stdlib import isolated_storage, telegram_update
 
 
 class TelegramAllTests(unittest.TestCase):
+    def test_all_never_calls_unpaid_model(self):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "complete", side_effect=HTTPError("https://example.test", 402, "Payment Required", {}, None)) as complete, patch("app.telegram_all.api_call", return_value=[]):
+            server.storage.set_telegram_chat_silent(555, True, 1)
+            result = server.handle_telegram_update(telegram_update("@all", "supergroup"))
+            self.assertEqual(result["handled"], "all_mentions")
+            complete.assert_not_called()
+
+    def test_all_send_failure_never_falls_through_to_model(self):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "complete") as complete, patch.object(server, "send_all_mentions", side_effect=HTTPError("https://example.test", 429, "Too Many Requests", {}, None)), patch.object(server, "try_send_telegram_message") as send:
+            result = server.handle_telegram_update(telegram_update("@all", "group"))
+            self.assertEqual(result["handled"], "all_mentions_failed")
+            self.assertIn("не использует модель", send.call_args.args[1])
+            complete.assert_not_called()
+
+    def test_payment_error_is_not_reported_as_timeout(self):
+        with isolated_storage(), patch.object(server, "TG_BOT_API_KEY", "test"), patch.object(server, "TG_OPEN_ACCESS", True), patch.object(server, "complete", side_effect=HTTPError("https://example.test", 402, "Payment Required", {}, None)), patch.object(server, "try_send_telegram_message") as send:
+            result = server.handle_telegram_update(telegram_update("Привет", "private"))
+            self.assertEqual(result["handled"], "model_unavailable")
+            self.assertIn("HTTP 402", send.call_args.args[1])
+            self.assertNotIn("не ответила вовремя", send.call_args.args[1])
+
     def test_exact_mention(self):
         for text in ("@all", "Привет, @ALL!", "Сбор @all завтра"):
             self.assertTrue(is_all_mention(text))

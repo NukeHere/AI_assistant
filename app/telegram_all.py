@@ -60,3 +60,4 @@ def send_all_mentions(storage, chat_id, token, thread_id=None):
         if thread_id is not None:
             payload["message_thread_id"] = thread_id
         api_call(token, "sendMessage", payload)
+    return len(mentions)

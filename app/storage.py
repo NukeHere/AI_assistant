@@ -218,6 +218,7 @@ class Storage:
                     message_id text not null,
                     primary key (chat_id, message_id)
                 );
+                create table if not exists bot_settings (key text primary key, value text not null);
                 create table if not exists schema_migrations (
                     name text primary key
                 );
@@ -303,6 +304,15 @@ class Storage:
         with self._lock, self._connect() as conn:
             conn.execute("delete from telegram_summary_requests where chat_id = ? and message_id = ?",
                          (str(chat_id), str(message_id)))
+
+    def model_selection(self):
+        with self._lock, self._connect() as conn:
+            row = conn.execute("select value from bot_settings where key = 'model_selection'").fetchone()
+            return row["value"] if row else "20b"
+
+    def set_model_selection(self, value):
+        with self._lock, self._connect() as conn:
+            conn.execute("insert into bot_settings (key, value) values ('model_selection', ?) on conflict(key) do update set value=excluded.value", (value,))
 
     def record_telegram_group_member(self, chat_id, user, active=True):
         user_id = str(user.get("id") or "")
