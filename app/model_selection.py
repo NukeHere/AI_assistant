@@ -44,7 +44,7 @@ def choose_model(selection, messages):
 
 
 def complete_groq(storage, messages):
-    token = os.getenv("GROQ_API_KEY") or os.getenv("MODEL_API_KEY", "")
+    token = os.getenv("GROQ_API_KEY", "").strip()
     if not token:
         raise RuntimeError("GROQ_API_KEY is required")
     selection = storage.model_selection()
@@ -53,7 +53,8 @@ def complete_groq(storage, messages):
         payload = {"model": models()[key]["id"], "messages": messages, "temperature": 0.7}
         request = Request("https://api.groq.com/openai/v1/chat/completions",
                           data=json.dumps(payload).encode(),
-                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                                   "User-Agent": "AI-assistant/1.0", "Accept": "application/json"})
         with urlopen(request, timeout=45) as response:
             content = json.load(response)["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():
@@ -64,4 +65,12 @@ def complete_groq(storage, messages):
     except HTTPError as error:
         if selection == "auto" and chosen == "120b" and error.code in {429, 500, 502, 503, 504}:
             return request_model("20b") + "\n\n[Ответ подготовлен на 20B из-за временной недоступности 120B.]"
-        raise
+        # Keep provider diagnostics useful without exposing credentials.
+        raw = error.read(4096).decode("utf-8", errors="replace")
+        try:
+            details = json.loads(raw).get("error", {})
+            reason = details.get("message", "") if isinstance(details, dict) else str(details)
+        except (ValueError, AttributeError):
+            reason = "Cloudflare blocked the API client" if "1010" in raw or "cloudflare" in raw.lower() else "Non-JSON provider response"
+        reason = re.sub(r"gsk_[\w-]+", "[redacted]", str(reason).replace(token, "[redacted]"))[:400]
+        raise RuntimeError(f"Groq HTTP {error.code}: {reason}") from error
