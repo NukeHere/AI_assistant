@@ -18,8 +18,8 @@ MINUTE_BUDGET = 7200
 
 
 def estimate_tokens(messages):
-    # Conservative UTF-8 estimate for mixed Russian/English chat, including roles.
-    return sum(math.ceil(len(str(m.get("content", "")).encode("utf-8")) / 3) + 8 for m in messages)
+    # Approximate UTF-8 estimate for mixed Russian/English chat, including roles.
+    return sum(math.ceil(len(str(m.get("content", "")).encode("utf-8")) / 4) + 8 for m in messages)
 
 
 def bounded_messages(messages):
