@@ -50,7 +50,9 @@ def complete_groq(storage, messages):
     selection = storage.model_selection()
     chosen = choose_model(selection, messages)
     def request_model(key):
-        payload = {"model": models()[key]["id"], "messages": messages, "temperature": 0.7}
+        api_messages = [{"role": message["role"], "content": message["content"]}
+                        for message in messages]
+        payload = {"model": models()[key]["id"], "messages": api_messages, "temperature": 0.7}
         request = Request("https://api.groq.com/openai/v1/chat/completions",
                           data=json.dumps(payload).encode(),
                           headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
