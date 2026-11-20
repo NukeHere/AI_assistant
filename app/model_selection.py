@@ -3,9 +3,50 @@ import json
 import os
 import re
 import time
+import math
+from collections import deque
+from threading import Lock
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+_usage_lock = Lock()
+_usage = {}
+INPUT_BUDGET = 5000
+OUTPUT_BUDGET = 512
+MINUTE_BUDGET = 7200
+
+
+def estimate_tokens(messages):
+    # Conservative UTF-8 estimate for mixed Russian/English chat, including roles.
+    return sum(math.ceil(len(str(m.get("content", "")).encode("utf-8")) / 3) + 8 for m in messages)
+
+
+def bounded_messages(messages):
+    result = [{"role": m["role"], "content": m["content"]} for m in messages]
+    # Preserve all instructions and the current request. History stays intact in DB.
+    while estimate_tokens(result) > INPUT_BUDGET:
+        removable = next((i for i, m in enumerate(result[:-1]) if m["role"] != "system"), None)
+        if removable is None:
+            raise GroqRequestError(413, "Current request and instructions exceed input budget")
+        result.pop(removable)
+    return result
+
+
+def reserve_tokens(model, amount):
+    if amount > MINUTE_BUDGET:
+        raise GroqRequestError(413, "Request exceeds minute budget")
+    while True:
+        with _usage_lock:
+            now = time.monotonic()
+            usage = _usage.setdefault(model, deque())
+            while usage and now - usage[0][0] >= 61:
+                usage.popleft()
+            if sum(tokens for _, tokens in usage) + amount <= MINUTE_BUDGET:
+                usage.append((now, amount))
+                return
+            delay = max(0.1, 61 - (now - usage[0][0]))
+        time.sleep(delay)
 
 
 class GroqRequestError(RuntimeError):
@@ -57,16 +98,16 @@ def complete_groq(storage, messages):
     selection = storage.model_selection()
     chosen = choose_model(selection, messages)
     def request_model(key):
-        api_messages = [{"role": message["role"], "content": message["content"]}
-                        for message in messages]
+        api_messages = bounded_messages(messages)
         payload = {"model": models()[key]["id"], "messages": api_messages,
-                   "temperature": 0.7, "max_completion_tokens": 1024}
+                   "temperature": 0.7, "max_completion_tokens": OUTPUT_BUDGET}
         request = Request("https://api.groq.com/openai/v1/chat/completions",
                           data=json.dumps(payload).encode(),
                           headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                                    "User-Agent": "AI-assistant/1.0", "Accept": "application/json"})
         for attempt in range(2):
             try:
+                reserve_tokens(key, estimate_tokens(api_messages) + OUTPUT_BUDGET)
                 with urlopen(request, timeout=45) as response:
                     content = json.load(response)["choices"][0]["message"]["content"]
                 break

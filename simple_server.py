@@ -1891,6 +1891,8 @@ def complete_openai_compatible(messages: list[dict[str, str]]) -> str:
 
 def model_failure_message(error: Exception) -> str:
     code = getattr(error, "code", None)
+    if code == 413:
+        return "Сообщение вместе с необходимым контекстом превышает лимит бота. Сократи сообщение или раздели его на несколько частей."
     if code == 402:
         return "Сервис модели отклонил запрос: требуется оплата или восстановление доступного лимита (HTTP 402). Владельцу бота нужно проверить аккаунт провайдера. Команда @all в группе работает независимо от модели."
     if code in {401, 403}:
