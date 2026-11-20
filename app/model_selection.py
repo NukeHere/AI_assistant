@@ -93,15 +93,16 @@ def control_model(storage, user_id, text):
         return "Доступные модели\n" + "\n".join(f"{key}: {value['name']}" for key, value in models().items())
     if re.search(r"(какая|текущая|сейчас).*модел", text):
         return "Режим модели: " + storage.model_selection()
-    if not re.search(r"(смени|сменить|переключ|используй|выбирай|включи|выбери)", text):
+    short_choice = re.fullmatch(r"(?:120|20)\s*[bб]?|авто(?:матически)?", text)
+    if not short_choice and not re.search(r"(смени|сменить|переключ|используй|выбирай|включи|выбери)", text):
         return None
-    if not re.search(r"модел|20\s*b|120\s*b", text):
+    if not short_choice and not re.search(r"модел|(?<!\w)(?:120|20)\s*[bб]?(?!\w)", text):
         return None
-    if "автомат" in text:
+    if "автомат" in text or text == "авто":
         selection = "auto"
-    elif re.search(r"120\s*b|крут|мощн|сильн", text):
+    elif re.search(r"(?<!\w)120\s*[bб]?(?!\w)|крут|мощн|сильн|умн", text):
         selection = "120b"
-    elif re.search(r"20\s*b|легк|лёгк", text):
+    elif re.search(r"(?<!\w)20\s*[bб]?(?!\w)|легк|лёгк", text):
         selection = "20b"
     else:
         return "Уточни модель: 20B, 120B или автоматический выбор."
