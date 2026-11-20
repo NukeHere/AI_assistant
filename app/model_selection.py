@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 
 _usage_lock = Lock()
 _usage = {}
-INPUT_BUDGET = 5000
+INPUT_BUDGET = 6200
 OUTPUT_BUDGET = 512
 MINUTE_BUDGET = 7200
 
